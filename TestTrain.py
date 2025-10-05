@@ -190,34 +190,7 @@ def perturb_config(base_config, volume_shape, max_shift=1, rng=None):
     }
 
 
-    def voxel_box(center, size):
-        x0,y0,z0 = center
-        sx,sy,sz = size
-        x_start = max(0, x0 - sx//2)
-        x_end   = min(volume_shape[0], x0 + sx//2 + (1 if sx%2==1 else 0))
-        y_start = max(0, y0 - sy//2)
-        y_end   = min(volume_shape[1], y0 + sy//2 + (1 if sy%2==1 else 0))
-        z_start = max(0, z0 - sz//2)
-        z_end   = min(volume_shape[2], z0 + sz//2 + (1 if sz%2==1 else 0))
-        return (x_start, x_end, y_start, y_end, z_start, z_end)
-
-    def boxes_overlap(a_center,a_size,b_center,b_size):
-        ax0,ax1,ay0,ay1,az0,az1 = voxel_box(a_center,a_size)
-        bx0,bx1,by0,by1,bz0,bz1 = voxel_box(b_center,b_size)
-        # overlap if intervals overlap in all axes
-        return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0 or az1 <= bz0 or bz1 <= az0)
-
-    vois = []
-    attempts = 0
-    while len(vois) < num_vois and attempts < 300:
-        voi_size = (2,2,2)
-        voi_weight = float(rng.uniform(0.3, 0.6))
-        voi_center = random_position(voi_size)
-        if not boxes_overlap(voi_center, voi_size, target_center, target_size):
-            vois.append((voi_center, voi_weight, voi_size))
-        attempts += 1
-
-    return target_center, target_size, vois
+    
 
 
 
@@ -704,7 +677,7 @@ class GifCallback(DefaultCallbacks):
         if iteration % 100 == 0:
             env = BeamAngleEnv(config_env)
             obs, _ = env.reset()
-            frames = [env.render()]
+            #frames = [env.render()]
             terminated = truncated = False
 
             for _ in range(1):
@@ -769,7 +742,7 @@ if __name__ == "__main__":
     "base_config": base_config,
     "source_distance": 9,
     "voi_configs": voi_configs18,
-    "raster_grid": (5, 5),
+    "raster_grid": (4, 4),
     "raster_spacing": (1.0, 1.0),
     "max_steps": 1,
 }
