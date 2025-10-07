@@ -372,7 +372,7 @@ class BeamAngleEnv(gym.Env):
         
 
         # Target mask (small cube at center)
-        self.target_center = tuple(np.array(self.volume_shape) / 2)
+        self.target_center = tuple(np.array(self.volume_shape) // 2)
         self.volume_mask = np.zeros(self.volume_shape, dtype=np.float32)# the mask that will contain both target and Voi's mask, 1 on target positions
                                                                         # and weight values on the VOIs positions
         self.target_mask = self._create_target_mask(

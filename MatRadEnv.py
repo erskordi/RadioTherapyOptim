@@ -28,6 +28,9 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class Custom4DConvExtractor(BaseFeaturesExtractor):
+    """ Custom 3D ConvNet feature extractor for 4D input (C, D, H, W).
+    Our input is a 4D tensor: channels, depth, height, width, where channels are 2 (CT + dose).
+    """
     def __init__(self, observation_space, features_dim=256):
         # observation_space.shape = (C, D, H, W)
         super().__init__(observation_space, features_dim)
@@ -60,7 +63,7 @@ class PyRadPlanAngleEnv(gym.Env):
     Gymnasium environment for selecting beam angles (Phase 1).
     - Discrete action over candidate beams (indices)
     - Observation: CT grid (downsampled) + structure masks + current cumulative dose (flattened)
-    - Reward: coverage - OAR penalties (customizable)
+    - Reward: coverage - OAR penalties 
     """
 
     metadata = {"render_modes": []}
