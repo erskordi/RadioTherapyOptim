@@ -25,7 +25,7 @@ class CustomConv3DModel(TorchModelV2, nn.Module):
 
         # Compute the flattened size
         with torch.no_grad():
-            sample_input = torch.zeros((1, 2, 129, 167, 167))
+            sample_input = torch.zeros((1, 2, 18, 18, 18))
             conv_out_size = self.conv(sample_input).shape[1]
 
         # Fully connected layers
