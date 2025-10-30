@@ -984,10 +984,10 @@ if __name__ == "__main__":
         ray.init()
         
         register_env("CustomEnv-v0", lambda config: BeamAngleEnv(config))
-        # ModelCatalog.register_custom_model(
-        #     "CustomConv3DModel",
-        #     CustomConv3DModel,
-        # )
+        ModelCatalog.register_custom_model(
+             "CustomConv3DModel",
+             CustomConv3DModel,
+         )
         
         rl_module = Policy.from_checkpoint(path_to_policy)
         env = BeamAngleEnv(config_env)
