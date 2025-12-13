@@ -224,43 +224,72 @@ def clamp_center(center, size, volume_shape):
         clamped.append(c)
     return tuple(clamped)
 
+# Add this helper function
+def boxes_intersect(c1, s1, c2, s2):
+    """
+    Check if two 3D boxes intersect.
+    c: center (x,y,z), s: size (w,h,d)
+    """
+    for i in range(3):
+        dist = abs(c1[i] - c2[i])
+        # Half-size sum (assuming center is middle of voxel)
+        # We add a small buffer (e.g., 1 voxel) to ensure they don't even touch
+        min_dist = (s1[i] + s2[i]) / 2.0 + 1.0 
+        if dist < min_dist:
+            return True
+    return False
+
+# Updated perturb_config
 def perturb_config(base_config, volume_shape, max_shift=1, rng=None):
-    """
-    base_config: dict with keys "target_center","target_size","vois" 
-    returns a new config with small integer shifts applied to centers, clipped inside volume.
-    max_shift: maximum absolute integer shift in voxels per axis
-    """
     if rng is None:
-        rng = np.random.default_rng() # Use default generator if none provided
+        rng = np.random.default_rng()
 
-    # perturb target center by integer offsets
+    # 1. Place Target
     tcenter = np.array(base_config["target_center"], dtype=int)
-    
-    
+    tsize = base_config["target_size"]
     shift = rng.integers(-max_shift, max_shift+1, size=3)
+    new_tcenter = clamp_center(tcenter + shift, tsize, volume_shape)
     
-    
-    size = base_config["target_size"]
-    new_tcenter = clamp_center(tcenter + shift, size, volume_shape)
-
-    # VOIs: perturb each center a bit and also jitter weight slightly (optional)
+    # 2. Place VOIs with Collision Check
     new_vois = []
+    
     for (c, w, size) in base_config["vois"]:
         c = np.array(c, dtype=int)
         
-        # --- START FIX ---
-        # Use .integers() instead of .randint()
-        shift = rng.integers(-max_shift, max_shift+1, size=3)
-        # --- END FIX ---
+        # Try to find a non-overlapping position (max 10 attempts)
+        valid_pos = False
+        for _ in range(10): 
+            shift = rng.integers(-max_shift, max_shift+1, size=3)
+            candidate_c = clamp_center(c + shift, size, volume_shape)
+            
+            # Check collision with Target
+            if boxes_intersect(new_tcenter, tsize, candidate_c, size):
+                continue
+            
+            # Check collision with already placed VOIs (Optional, if you want distinct OARs)
+            collision_with_other_voi = False
+            for (existing_c, _, existing_size) in new_vois:
+                if boxes_intersect(existing_c, existing_size, candidate_c, size):
+                    collision_with_other_voi = True
+                    break
+            if collision_with_other_voi:
+                continue
+
+            # If we got here, it's valid
+            valid_pos = True
+            final_c = candidate_c
+            break
         
-        new_c = clamp_center(c + shift,size, volume_shape)
-        # jitter weight a little but keep it positive
+        # Fallback: if we couldn't place it without overlap, keep original clamped or skip
+        if not valid_pos:
+            final_c = clamp_center(c, size, volume_shape) 
+
         w_new = float(np.clip(w + rng.normal(scale=0.05), 0.05, 10.0))
-        new_vois.append((new_c, w_new, size))
+        new_vois.append((final_c, w_new, size))
 
     return {
         "target_center": tuple(new_tcenter),
-        "target_size": tuple(base_config["target_size"]),
+        "target_size": tuple(tsize),
         "vois": new_vois,
     }
 
