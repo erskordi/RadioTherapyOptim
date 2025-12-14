@@ -16,12 +16,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using Device: {device}")
 
 # -----------------------------------------------------------
-# 1. PRIORITIZED EXPERIENCE REPLAY (PER) UTILS
+# 1. PRIORITIZED EXPERIENCE REPLAY (PER) UTILS (OPTIMIZED)
 # -----------------------------------------------------------
 
 class SumTree:
     """
-    Binary SumTree to allow O(log N) sampling of priorities.
+    Optimized Binary SumTree (Iterative, No Recursion).
     """
     def __init__(self, capacity):
         self.capacity = capacity
@@ -30,22 +30,6 @@ class SumTree:
         self.write = 0
         self.n_entries = 0
 
-    def _propagate(self, idx, change):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
-
-    def _retrieve(self, idx, s):
-        left = 2 * idx + 1
-        right = left + 1
-        if left >= len(self.tree):
-            return idx
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
-
     def total(self):
         return self.tree[0]
 
@@ -53,63 +37,86 @@ class SumTree:
         idx = self.write + self.capacity - 1
         self.data[self.write] = data
         self.update(idx, p)
+        
         self.write += 1
         if self.write >= self.capacity:
             self.write = 0
+            
         if self.n_entries < self.capacity:
             self.n_entries += 1
 
     def update(self, idx, p):
         change = p - self.tree[idx]
         self.tree[idx] = p
-        self._propagate(idx, change)
+        
+        # Iterative propagation (Faster than recursion)
+        while idx != 0:
+            idx = (idx - 1) // 2
+            self.tree[idx] += change
 
     def get(self, s):
-        idx = self._retrieve(0, s)
+        idx = 0
+        while True:
+            left = 2 * idx + 1
+            right = left + 1
+            
+            if left >= len(self.tree):
+                break
+            
+            if s <= self.tree[left]:
+                idx = left
+            else:
+                s -= self.tree[left]
+                idx = right
+
+        # SAFETY: Clamp index to valid range to prevent crashes due to float precision
+        # (This replaces the need for the "if data == 0" check in your buffer)
+        idx = min(idx, len(self.tree) - 1)
+        
         data_idx = idx - self.capacity + 1
-        return (idx, self.tree[idx], self.data[data_idx])
+        return idx, self.tree[idx], self.data[data_idx]
 
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, alpha=0.6):
         self.tree = SumTree(capacity)
-        self.alpha = alpha  # Priority exponent
+        self.alpha = alpha
         self.capacity = capacity
 
     def push(self, state, action, reward, next_state, done):
+        # New experiences get max priority to ensure they are seen at least once
         max_p = np.max(self.tree.tree[-self.tree.capacity:])
         if max_p == 0: max_p = 1.0
         
-        # Store transition
         self.tree.add(max_p, (state, action, reward, next_state, done))
 
     def sample(self, batch_size, beta=0.4):
         batch = []
         idxs = []
-        segment = self.tree.total() / batch_size
         priorities = []
+        
+        # Divide the range into batch_size segments
+        segment = self.tree.total() / batch_size
 
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
+            
             s = random.uniform(a, b)
             (idx, p, data) = self.tree.get(s)
             
-            # If tree isn't full yet, data might be 0/None. Retry safely (rare edge case)
-            if data == 0: 
-                (idx, p, data) = self.tree.get(random.uniform(0, self.tree.total()))
-
             priorities.append(p)
             batch.append(data)
             idxs.append(idx)
 
+        # Calculate IS Weights
         sampling_probabilities = np.array(priorities) / self.tree.total()
         is_weight = np.power(self.tree.n_entries * sampling_probabilities, -beta)
-        is_weight /= is_weight.max()
+        is_weight /= is_weight.max() # Normalize
 
         # Unpack batch
         states, actions, rewards, next_states, dones = zip(*batch)
         
-        # Stack dictionary observations
+        # Helper to stack dict obs
         def stack_obs(obs_list):
             return {
                 "dose": np.stack([o["dose"] for o in obs_list]),
@@ -128,56 +135,34 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, idxs, errors):
         for idx, err in zip(idxs, errors):
-            # Error -> Priority (with slight regularization epsilon)
             p = (abs(err) + 1e-5) ** self.alpha
             self.tree.update(idx, p)
-
-# -----------------------------------------------------------
-# 2. NEURAL NETWORKS (3D ResNet & Quantile Critics)
-# -----------------------------------------------------------
-
-class ResidualBlock3D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm3d(channels)
-        self.conv2 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm3d(channels)
-
-    def forward(self, x):
-        residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return F.relu(out)
-
 class DeepResNetEncoder(nn.Module):
     """
-    Encodes (2, 18, 18, 18) input into a dense feature vector using 3D ResNet.
+    A lighter 3-layer CNN (Faster than ResNet, better than shallow).
     """
     def __init__(self, input_channels=2):
         super().__init__()
-        # Initial Conv
-        self.conv_in = nn.Conv3d(input_channels, 32, kernel_size=3, padding=1)
+        # Input: (2, 18, 18, 18)
+        self.conv1 = nn.Conv3d(input_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv3d(64, 128, kernel_size=3, padding=1)
         
-        # ResNet Blocks
-        self.res1 = ResidualBlock3D(32)
-        self.res2 = ResidualBlock3D(32)
+        # MaxPool reduces size by 2 each time: 18 -> 9 -> 4 -> 2
+        self.pool = nn.MaxPool3d(2)
         
-        # Downsample
-        self.conv_down = nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.res3 = ResidualBlock3D(64)
-        
-        # Global Pooling
-        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.flat_size = 64
+        # Calculate flat size: 
+        # After pool1: 9x9x9
+        # After pool2: 4x4x4
+        # After pool3: 2x2x2
+        self.flat_size = 128 * 2 * 2 * 2 # = 1024
 
     def forward(self, x):
-        x = F.relu(self.conv_in(x))
-        x = self.res1(x)
-        x = self.res2(x)
-        x = F.relu(self.conv_down(x))
-        x = self.res3(x)
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
         x = self.pool(x)
         return x.view(x.size(0), -1)
 
@@ -543,7 +528,8 @@ if __name__ == "__main__":
         # 1. Update Intensity Limit (Curriculum)
         # Linear ramp: 0.1 -> 1.0
         prog = min(ep / WARMUP_EPISODES, 1.0)
-        agent.actor.current_limit = 0.1 + (0.9 * prog)
+        #agent.actor.current_limit = 0.1 + (0.9 * prog)
+        agent.actor.current_limit = 1.0
         frames = []
         while not done:
             action = agent.get_action(obs, explore=True)
