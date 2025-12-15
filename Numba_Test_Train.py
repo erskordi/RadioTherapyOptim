@@ -483,6 +483,8 @@ class BeamAngleEnv(gym.Env):
 
         self.beam_slots = [None for _ in range(self.max_beams)]
         self.dose_total = np.zeros(self.volume_shape, dtype=np.float32)
+        self.prev_target_cost = self._get_target_cost(self.dose_total)
+        self.prev_oar_cost = self._get_oar_cost(self.dose_total)
         self.beam_params_array = np.zeros(self.beam_params_shape, dtype=np.float32)
         
         self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
@@ -541,11 +543,73 @@ class BeamAngleEnv(gym.Env):
             "beams": self.beam_params_array
         }
         
-        reward = self._compute_reward(self.dose_total)
+        #reward = self._compute_reward(self.dose_total)
+        # ---------------- NEW REWARD LOGIC ----------------
+        # 1. Calculate New Costs
+        curr_target_cost = self._get_target_cost(self.dose_total)
+        curr_oar_cost = self._get_oar_cost(self.dose_total)
+        
+        # 2. Calculate Diffs
+        # Improvement > 0 if we added dose to tumor
+        target_improvement = self.prev_target_cost - curr_target_cost
+        
+        # Degradation > 0 if we hit an OAR (Cost went up)
+        oar_degradation = curr_oar_cost - self.prev_oar_cost
+        
+        # 3. Define Weights
+        w_progress = 5.0  # Reward for fixing the tumor
+        w_safety = 10.0   # Penalty for hitting OAR (Higher priority)
+        w_final = 10.0    # Penalty for failing to finish the job
+        
+        # 4. Step Reward
+        # Reward for target progress - Penalty for OAR damage
+        reward = (w_progress * target_improvement) - (w_safety * oar_degradation)
+
         self.step_count += 1
         terminated = (self.step_count >= self.max_steps)
+        if terminated:
+            reward -= (w_final * curr_target_cost)
+            
+        # 6. Update History
+        self.prev_target_cost = curr_target_cost
+        self.prev_oar_cost = curr_oar_cost
+        
+        # Clip for stability
+        reward = float(np.clip(reward, -20.0, 5.0))
         
         return obs, float(reward), terminated, False, {}
+
+    def _get_target_cost(self, dose):
+        """ Calculate Mean Squared Underdose Error for Target """
+        target_mask = np.isclose(self.volume_mask, 1)
+        if not np.any(target_mask): return 1.0 # Should not happen
+        
+        target_doses = dose[target_mask]
+        # Error = (1.0 - dose)^2, only if dose < 1.0
+        diff = 1.0 - target_doses
+        underdose = np.maximum(diff, 0.0)
+        return np.mean(underdose**2)
+
+    def _get_oar_cost(self, dose):
+        """ Calculate Mean Squared Overdose Error for OARs """
+        total_oar_cost = 0.0
+        unique_vals = np.unique(self.volume_mask)
+        
+        for val in unique_vals:
+            if val == 0.0 or np.isclose(val, 1.0): continue
+            
+            voi_mask = np.isclose(self.volume_mask, val)
+            if not np.any(voi_mask): continue
+            
+            voi_doses = dose[voi_mask]
+            tolerance = float(val)
+            
+            # Error = (dose - tolerance)^2, only if dose > tolerance
+            diff = voi_doses - tolerance
+            overdose = np.maximum(diff, 0.0)
+            total_oar_cost += np.mean(overdose**2)
+            
+        return total_oar_cost
 
     def _compute_reward(self, dose):
         """
