@@ -9,7 +9,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import imageio as iio
 
-# Import your optimized Numba Environment
+# Import  Numba Environment
 from Numba_Test_Train import BeamAngleEnv
 
 # Check for GPU
@@ -17,12 +17,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using Device: {device}")
 
 # -----------------------------------------------------------
-# 1. UTILS (PER + Plotting)
+# 1. UTILS (Prioritized Experience Replay + Plotting)
 # -----------------------------------------------------------
 
 def save_plots(scores, cvar_history, filename="learning_curves.png"):
     """
-    Plots Reward and CVaR curves with moving averages.
+    Plots Cumulative Return and CVaR curves with moving averages (to have a smoother curve).
     """
     window = 50
     
@@ -149,19 +149,26 @@ class PrioritizedReplayBuffer:
 class DeepResNetEncoder(nn.Module):
     def __init__(self, input_channels=2):
         super().__init__()
-        self.conv1 = nn.Conv3d(input_channels, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv3d(64, 128, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool3d(2)
-        self.flat_size = 128 * 2 * 2 * 2 
+        # Input: (Batch, 2, 18, 18, 18)
+        
+        # Layer 1: Keep size, find edges
+        self.conv1 = nn.Conv3d(input_channels, 16, kernel_size=3, padding=1) 
+        # Output: (16, 18, 18, 18)
+        
+        # Layer 2: Downsample
+        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1) 
+        # Output: (32, 9, 9, 9)
+        
+        # Layer 3: Deep features
+        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1) 
+        # Output: (64, 5, 5, 5)
+
+        self.flat_size = 64 * 5 * 5 * 5  # = 8000 features
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
-        x = self.pool(x)
         x = F.relu(self.conv2(x))
-        x = self.pool(x)
         x = F.relu(self.conv3(x))
-        x = self.pool(x)
         return x.view(x.size(0), -1)
 
 class EnsembleQuantileCritic(nn.Module):
@@ -189,14 +196,6 @@ class Actor(nn.Module):
         self.net = nn.Sequential(nn.Linear(input_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, action_dim))
         self.register_buffer("low", torch.tensor(action_low))
         self.register_buffer("high", torch.tensor(action_high))
-
-    def forward(self, state):
-        img_feat = self.encoder(state["dose"])
-        beam_feat = state["beams"]
-        x = torch.cat([img_feat, beam_feat, action], dim=1) # Note: 'action' undefined here in forward logic of Actor? 
-        # Wait, previous Actor code had specific logic.
-        # Correction: Actor input is State only.
-        pass # Replaced by correct logic below
 
     def forward(self, state):
         img_feat = self.encoder(state["dose"])
