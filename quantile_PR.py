@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import imageio as iio
 
 # Import your optimized Numba Environment
-from beam_env_with_actor import BeamAngleEnv
+from Numba_Test_Train import BeamAngleEnv
 
 # Check for GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
