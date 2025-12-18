@@ -149,30 +149,23 @@ class PrioritizedReplayBuffer:
 class DeepResNetEncoder(nn.Module):
     def __init__(self, input_channels=2):
         super().__init__()
-        # Input: (Batch, 2, 18, 18, 18)
-        
-        # Layer 1: Keep size, find edges
-        self.conv1 = nn.Conv3d(input_channels, 16, kernel_size=3, padding=1) 
-        # Output: (16, 18, 18, 18)
-        
-        # Layer 2: Downsample
-        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1) 
-        # Output: (32, 9, 9, 9)
-        
-        # Layer 3: Deep features
-        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1) 
-        # Output: (64, 5, 5, 5)
-
-        self.flat_size = 64 * 5 * 5 * 5  # = 8000 features
+        self.conv1 = nn.Conv3d(input_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv3d(64, 128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool3d(2)
+        self.flat_size = 128 * 2 * 2 * 2 
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
+        x = self.pool(x)
         x = F.relu(self.conv2(x))
+        x = self.pool(x)
         x = F.relu(self.conv3(x))
+        x = self.pool(x)
         return x.view(x.size(0), -1)
 
 class EnsembleQuantileCritic(nn.Module):
-    def __init__(self, obs_shape, beam_dim, action_dim, n_quantiles=25, ensemble_size=2):
+    def __init__(self, obs_shape, beam_dim, action_dim, n_quantiles=25, ensemble_size=1):
         super().__init__()
         self.ensemble_size = ensemble_size
         self.n_quantiles = n_quantiles
@@ -201,22 +194,7 @@ class Actor(nn.Module):
         img_feat = self.encoder(state["dose"])
         beam_feat = state["beams"]
         x = torch.cat([img_feat, beam_feat], dim=1)
-        
-        raw_action = self.net(x)
-        
-        # Split logic
-        geo_dim = 2; energy_dim = 6
-        angles = torch.tanh(raw_action[:, :geo_dim])
-        energies = torch.sigmoid(raw_action[:, geo_dim:geo_dim+energy_dim])
-        intensities = torch.sigmoid(raw_action[:, geo_dim+energy_dim:])
-        
-        combined = torch.cat([angles, energies, intensities], dim=1)
-        
-        # Scale
-        scaled = combined * 1.0 
-        angle_low = self.low[:geo_dim]; angle_high = self.high[:geo_dim]
-        scaled[:, :geo_dim] = (angles * (angle_high - angle_low) / 2.0) + (angle_high + angle_low) / 2.0
-        return scaled
+        return torch.tanh(self.net(x))
 
 # -----------------------------------------------------------
 # 3. RACER AGENT
@@ -230,6 +208,17 @@ class RACER_Quantile_PER:
         self.n_quantiles = 25
         self.batch_size = 64
         self.lr = 3e-4
+        self.noise_start = 0.3
+        self.noise_end = 0.01  # Exploration floor
+        self.noise_decay = 0.999 # Decay rate
+        self.current_noise = self.noise_start
+        # Store bounds as tensors for the update loop
+        self.action_low_tensor = torch.FloatTensor(env.action_space.low).to(device)
+        self.action_high_tensor = torch.FloatTensor(env.action_space.high).to(device)
+        
+        # Store bounds as numpy for get_action (CPU)
+        self.action_low_numpy = env.action_space.low
+        self.action_high_numpy = env.action_space.high
         
         self.obs_shape = env.observation_space["dose"].shape
         self.beam_dim = env.observation_space["beams"].shape[0]
@@ -254,12 +243,22 @@ class RACER_Quantile_PER:
             beams = beams.unsqueeze(0) 
         state_tensor = {"dose": dose, "beams": beams}
         with torch.no_grad():
-            action = self.actor(state_tensor)
-        action = action.cpu().numpy()[0]
+            # 1. Get Normalized Action [-1, 1]
+            raw_action = self.actor(state_tensor).cpu().numpy()[0]
+        
         if explore:
-            noise = np.random.normal(0, 0.15, size=action.shape)
-            action = np.clip(action + noise, env.action_space.low, env.action_space.high)
-        return action
+            # 2. Add Noise to [-1, 1] space
+            noise = np.random.normal(0, self.current_noise, size=raw_action.shape)
+            raw_action = np.clip(raw_action + noise, -1.0, 1.0)
+            self.current_noise = max(self.noise_end, self.current_noise * self.noise_decay)
+        
+        # 3. Scale to Environment Units
+        # Formula: low + 0.5 * (raw + 1) * (high - low)
+        # This is mathematically identical to your manual scaling for angles,
+        # and treats energy/intensity (0-1) correctly if their low=0, high=1.
+        scaled_action = self.action_low_numpy + 0.5 * (raw_action + 1.0) * (self.action_high_numpy - self.action_low_numpy)
+        
+        return scaled_action
 
     def get_ensemble_cvar(self, state, action, alpha):
         quantiles = self.critic(state, action)
@@ -287,7 +286,10 @@ class RACER_Quantile_PER:
 
         # Critic Update
         with torch.no_grad():
-            next_action = self.actor(next_state)
+            next_raw_action = self.actor(next_state) # Returns [-1, 1]
+            
+            # Scale next_action before passing to target_critic
+            next_action = self.action_low_tensor + 0.5 * (next_raw_action + 1.0) * (self.action_high_tensor - self.action_low_tensor)
             target_q = self.target_critic(next_state, next_action)
             target_pooled = target_q.view(self.batch_size, -1)
             target_Z = rew + (1 - done) * self.gamma * target_pooled
@@ -319,6 +321,7 @@ class RACER_Quantile_PER:
 
         # Actor Update
         new_action = self.actor(state)
+        new_action = self.action_low_tensor + 0.5 * (new_action + 1.0) * (self.action_high_tensor - self.action_low_tensor)
         cvar = self.get_ensemble_cvar(state, new_action, self.alpha_cvar)
         actor_loss = -cvar.mean()
         self.actor_optimizer.zero_grad()
@@ -347,7 +350,7 @@ if __name__ == "__main__":
     env = BeamAngleEnv(config_env)
     agent = RACER_Quantile_PER(env, config_env)
     
-    TOTAL_EPISODES = 5000
+    TOTAL_EPISODES = 2500
     
     scores = []
     cvar_history = []

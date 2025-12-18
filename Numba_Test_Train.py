@@ -464,7 +464,7 @@ class BeamAngleEnv(gym.Env):
             cfg = config_override
         else:
             cfg = perturb_config(self.base_scene, self.volume_shape, rng=self.np_random)
-
+            #cfg = self.base_scene
         # Rebuild masks
         self.target_center = tuple(map(int, cfg["target_center"]))
         self.target_size = tuple(map(int, cfg["target_size"]))
@@ -485,6 +485,7 @@ class BeamAngleEnv(gym.Env):
         self.dose_total = np.zeros(self.volume_shape, dtype=np.float32)
         self.prev_target_cost = self._get_target_cost(self.dose_total)
         self.prev_oar_cost = self._get_oar_cost(self.dose_total)
+        self.prev_body_cost = self._get_body_cost(self.dose_total)
         self.beam_params_array = np.zeros(self.beam_params_shape, dtype=np.float32)
         
         self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
@@ -548,22 +549,24 @@ class BeamAngleEnv(gym.Env):
         # 1. Calculate New Costs
         curr_target_cost = self._get_target_cost(self.dose_total)
         curr_oar_cost = self._get_oar_cost(self.dose_total)
-        
+        curr_body_cost = self._get_body_cost(self.dose_total)
         # 2. Calculate Diffs
         # Improvement > 0 if we added dose to tumor
         target_improvement = self.prev_target_cost - curr_target_cost
         
         # Degradation > 0 if we hit an OAR (Cost went up)
         oar_degradation = curr_oar_cost - self.prev_oar_cost
-        
+        body_degradation = curr_body_cost - self.prev_body_cost
         # 3. Define Weights
-        w_progress = 5.0  # Reward for fixing the tumor
-        w_safety = 10.0   # Penalty for hitting OAR (Higher priority)
-        w_final = 10.0    # Penalty for failing to finish the job
+        w_progress = 1.0  # Reward for fixing the tumor
+        w_safety = 3.0   # Penalty for hitting OAR (Higher priority)
+        w_final = 2.0 
+        w_body = 0.1
+        #penalty for hitting body volume
         
         # 4. Step Reward
         # Reward for target progress - Penalty for OAR damage
-        reward = (w_progress * target_improvement) - (w_safety * oar_degradation)
+        reward = (w_progress * target_improvement) - (w_safety * oar_degradation) - (w_body)
 
         self.step_count += 1
         terminated = (self.step_count >= self.max_steps)
@@ -575,7 +578,7 @@ class BeamAngleEnv(gym.Env):
         self.prev_oar_cost = curr_oar_cost
         
         # Clip for stability
-        reward = float(np.clip(reward, -20.0, 5.0))
+        #reward = float(np.clip(reward, -20.0, 5.0))
         
         return obs, float(reward), terminated, False, {}
 
@@ -610,6 +613,19 @@ class BeamAngleEnv(gym.Env):
             total_oar_cost += np.mean(overdose**2)
             
         return total_oar_cost
+    
+    def _get_body_cost(self, dose):
+        """ Calculate Mean Squared Overdose Error for Body Volume """
+        body_mask = np.isclose(self.volume_mask, 0.0)
+        if not np.any(body_mask): return 0.0 # Should not happen
+        
+        body_doses = dose[body_mask]
+        tolerance = 0.0
+        
+        # Error = (dose - tolerance)^2, only if dose > tolerance
+        diff = body_doses - tolerance
+        overdose = np.maximum(diff, 0.0)
+        return np.mean(overdose**2)
 
     def _compute_reward(self, dose):
         """
