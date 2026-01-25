@@ -328,15 +328,19 @@ class Beam:
     def get_source_point(self):
         return self.volume_center - self.source_distance * self.direction
     
-    def _angles_to_direction(self, gantry, couch): 
+    def _angles_to_direction(self, gantry, elevation): 
         """
-        gantry: xy-plane [-pi, pi]
-        couch:  z [0,pi]
+        gantry: azimuth in xy-plane [-π, π]
+        elevation: angle from xy-plane [-π/2, π/2]
+    
+        elevation = 0 → horizontal beam (in xy-plane)
+        elevation = π/2 → beam pointing up
+        elevation = -π/2 → beam pointing down
         """
-        x = np.sin(couch) * np.cos(gantry) 
-        y = np.sin(couch) * np.sin(gantry) 
-        z = np.cos(couch) 
-        v = np.array([x,y,z], dtype=float) 
+        x = np.cos(elevation) * np.cos(gantry) 
+        y = np.cos(elevation) * np.sin(gantry) 
+        z = np.sin(elevation) 
+        v = np.array([x, y, z], dtype=float) 
         v /= np.linalg.norm(v) + 1e-12
         return -v
     
@@ -424,12 +428,12 @@ class BeamAngleEnv(gym.Env):
         
         # Action space
         single_beam_low = np.concatenate([
-            np.array([-np.pi, 0], dtype=np.float32), 
+            np.array([-np.pi, -np.pi/3], dtype=np.float32), 
             np.zeros(self.num_layers, dtype=np.float32),            
             np.zeros(self.num_layers * self.num_raster_points, dtype=np.float32) 
         ])
         single_beam_high = np.concatenate([
-            np.array([np.pi, np.pi], dtype=np.float32), 
+            np.array([np.pi, np.pi/3], dtype=np.float32), 
             np.ones(self.num_layers, dtype=np.float32),            
             np.ones(self.num_layers * self.num_raster_points, dtype=np.float32) 
         ])
@@ -445,13 +449,8 @@ class BeamAngleEnv(gym.Env):
                     high=np.finfo(np.float32).max,
                     shape=(2,) + self.volume_shape, 
                     dtype=np.float32
-                ),
-                "beams": spaces.Box(
-                    low=-np.pi, 
-                    high=np.pi, 
-                    shape=self.beam_params_shape,
-                    dtype=np.float32
                 )
+                
             }
         )
         self.beam_slots = [None for _ in range(self.max_beams)]
@@ -494,8 +493,7 @@ class BeamAngleEnv(gym.Env):
         
         self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
         obs = {
-            "dose": self.state,
-            "beams": self.beam_params_array
+            "dose": self.state
         }
         return obs, {}
 
@@ -509,6 +507,7 @@ class BeamAngleEnv(gym.Env):
 
         gantry = float(action[0])
         couch = float(action[1])
+        #print(f"Step {self.step_count}: gantry={gantry:.4f}, couch={couch:.4f}", flush=True)
         energy_u = action[2: 2 + self.num_layers]
         ints = action[2 + self.num_layers : 2 + self.num_layers + self.num_layers * self.num_raster_points]
         
@@ -544,8 +543,7 @@ class BeamAngleEnv(gym.Env):
 
         self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
         obs = {
-            "dose": self.state,
-            "beams": self.beam_params_array
+            "dose": self.state
         }
         
         #reward = self._compute_reward(self.dose_total)
@@ -562,9 +560,9 @@ class BeamAngleEnv(gym.Env):
         oar_degradation = curr_oar_cost - self.prev_oar_cost
         #body_degradation = curr_body_cost - self.prev_body_cost
         # 3. Define Weights
-        w_progress = 1.0  # Reward for fixing the tumor
-        w_safety = 1.0   # Penalty for hitting OAR (Higher priority)
-        w_final = 1.0 
+        w_progress = 15  # Reward for fixing the tumor
+        w_safety = 5   # Penalty for hitting OAR (Higher priority)
+        w_final = 2 
         w_body = 0.1
         #penalty for hitting body volume
         

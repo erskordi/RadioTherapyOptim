@@ -139,43 +139,26 @@ class ImpalaBlock3D(nn.Module):
         return x
 
 class DeepResNetEncoder(nn.Module):
-    def __init__(self,  input_channels=2, depths=[16, 32, 32]):
+    def __init__(self, input_channels=2):
         super().__init__()
-        
-        # Stage 1
-        self.block1 = ImpalaBlock3D(input_channels, depths[0])
-        
-        # Stage 2
-        self.block2 = ImpalaBlock3D(depths[0], depths[1])
-        
-        # Stage 3
-        self.block3 = ImpalaBlock3D(depths[1], depths[2])
-        
-        self.relu = nn.ReLU()
-        
-        # --- Automatic Output Size Calculation ---
-        # This runs a dummy pass to calculate the flat size automatically.
-        # It prevents math errors if you change input size or depth later.
-        with torch.no_grad():
-            dummy = torch.zeros(1, input_channels, 18, 18, 18) # Adjust 16s to your approx input size
-            dummy = self.block1(dummy)
-            dummy = self.block2(dummy)
-            dummy = self.block3(dummy)
-            self.flat_size = dummy.numel()
+        self.conv1 = nn.Conv3d(input_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv3d(64, 128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool3d(2)
+        self.flat_size = 128 * 2 * 2 * 2 
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        
-        x = self.relu(x)
-        x = x.view(x.size(0), -1) # Flatten
-        return x
-    
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        return x.view(x.size(0), -1)
 
 
 class EnsembleQuantileCritic(nn.Module):
-    def __init__(self, obs_shape, beam_dim, action_dim, n_quantiles=25, ensemble_size=5):
+    def __init__(self, obs_shape, beam_dim, action_dim, n_quantiles=51, ensemble_size=5):
         super().__init__()
         self.ensemble_size = ensemble_size
         self.n_quantiles = n_quantiles
@@ -221,7 +204,7 @@ class RACER_Quantile_PER:
         self.tau = 0.005
         self.alpha_cvar = 0.10
         self.n_quantiles = 25
-        self.batch_size = 64
+        self.batch_size = 256
         self.lr = 3e-4
         self.noise_start = 0.2
         self.noise_end = 0.1  # Exploration floor
@@ -249,15 +232,16 @@ class RACER_Quantile_PER:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr)
         
-        self.memory = ReplayBuffer(50000, device = device)
+        self.memory = ReplayBuffer(500000, device = device)
 
     def get_action(self, state, explore=True):
         self.actor.eval()
         dose = torch.FloatTensor(state["dose"]).to(device)
         beams = torch.FloatTensor(state["beams"]).to(device)
-        if dose.dim() == 4: 
-            dose = dose.unsqueeze(0)   
-            beams = beams.unsqueeze(0) 
+        if dose.dim() == 4:  # [C, D, H, W] -> [1, C, D, H, W]
+            dose = dose.unsqueeze(0)
+        if beams.dim() == 1:  # [beam_dim] -> [1, beam_dim]
+            beams = beams.unsqueeze(0)
         state_tensor = {"dose": dose, "beams": beams}
         with torch.no_grad():
             # 1. Get Normalized Action [-1, 1]
@@ -278,14 +262,21 @@ class RACER_Quantile_PER:
         return scaled_action
 
     def get_ensemble_cvar(self, state, action, alpha):
-        quantiles = self.critic(state, action)
-        pooled = quantiles.view(quantiles.shape[0], -1)
-        sorted_q, _ = torch.sort(pooled, dim=1)
-        k = max(1, int(sorted_q.shape[1] * alpha))
-        tail = sorted_q[:, :k]
-        return tail.mean(dim=1, keepdim=True)
+        quantiles = self.critic(state, action)  # [B, Ensemble, N_Q]
+    
+        cvars = []
+        for i in range(self.critic.ensemble_size):
+            q_i = quantiles[:, i, :]  # [B, N_Q]
+            sorted_q, _ = torch.sort(q_i, dim=1)
+            k = max(1, int(sorted_q.shape[1] * alpha))
+            cvar_i = sorted_q[:, :k].mean(dim=1, keepdim=True)  # [B, 1]
+            cvars.append(cvar_i)
+    
+        #   Average CVaR across ensemble
+        stacked = torch.stack(cvars, dim=1)  # [B, Ensemble, 1]
+        return stacked.mean(dim=1)  # [B, 1]
 
-    def update(self, per_beta=0.4):
+    def update(self):
         self.step_counter += 1
         if len(self.memory) < self.batch_size:
             return None
@@ -306,7 +297,8 @@ class RACER_Quantile_PER:
             sorted_z, _ = torch.sort(target_pooled, dim=1)
         
         # Keep bottom 80% (removes optimistic outliers)
-            n_keep = int(sorted_z.shape[1] * 0.8) 
+            d=0.8
+            n_keep = int(sorted_z.shape[1] * d) 
             target_trunc = sorted_z[:, :n_keep]
         
             target_Z = reward + (1 - done) * self.gamma * target_trunc # [Batch, n_keep]
@@ -327,7 +319,7 @@ class RACER_Quantile_PER:
             tau = tau.view(1, -1, 1)
             element_loss = (tau - (diff.detach() < 0).float()).abs() * huber
             #weighted_loss = element_loss.mean(dim=(1, 2)) * per_weights.squeeze()
-            critic_loss += element_loss.mean()
+            critic_loss += element_loss.sum(dim=1).mean()
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -367,7 +359,7 @@ if __name__ == "__main__":
     base_config = {"volume_shape": (18, 18, 18), "target_center": (9, 9, 9), "target_size": (3, 3, 3), "vois": voi_configs18}
     config_env =  {"volume_shape": (18, 18, 18), "target_size": (3, 3, 3), "base_config": base_config, 
                    "source_distance": 9, "voi_configs": voi_configs18, "epsilon": 1e-3, "dose_target": 1.0, 
-                   "max_beams": 3, "num_layers": 6, "raster_grid": (4, 4), "raster_spacing": (1.0, 1.0), "max_steps": 3}
+                   "max_beams": 10, "num_layers": 6, "raster_grid": (4, 4), "raster_spacing": (1.0, 1.0), "max_steps": 10}
 
     env = BeamAngleEnv(config_env)
     agent = RACER_Quantile_PER(env, config_env)
@@ -376,7 +368,7 @@ if __name__ == "__main__":
     
     scores = []
     cvar_history = []
-    start_steps = 500
+    start_steps = 1000
     
     print("--- STARTING RACER TRAINING (With Plots) ---")
 
@@ -397,23 +389,25 @@ if __name__ == "__main__":
                 action = env.action_space.sample()
             else:
                 action = agent.get_action(obs, explore=True)
+                agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)
+        
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             frames.append(env.render())
             
             agent.memory.push(obs, action, reward, next_obs, done)
             
-            beta = min(1.0, 0.4 + 0.6 * (ep / TOTAL_EPISODES))
-            stats = agent.update(per_beta=beta)
+            if ep>= start_steps:
+                stats = agent.update()
             
-            if stats is not None:
-                ep_cvar_accum += stats[2]
-                updates_count += 1
-            
+                if stats is not None:
+                    ep_cvar_accum += stats[2]
+                    updates_count += 1
+            else:
+                stats = None
             obs = next_obs
             episode_reward += reward
-            agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)
-        
+            
         # End of Episode Stats
         scores.append(episode_reward)
         avg_cvar = (ep_cvar_accum / updates_count) if updates_count > 0 else None
@@ -422,16 +416,30 @@ if __name__ == "__main__":
         avg_score = np.mean(scores[-100:])
         
         if ep % 100 == 0:
-            iio.mimsave('eval.gif', frames, duration=1.0)
+            # [FIX] Run a dedicated EVALUATION episode (No Noise, No Training)
+            eval_obs, _ = env.reset() # Use standard or fixed config for fair comparison
+            eval_done = False
+            eval_frames = []
+            
+            while not eval_done:
+                # [FIX] explore=False ensures we see what the agent actually learned
+                eval_action = agent.get_action(eval_obs, explore=False) 
+                eval_next_obs, _, eval_term, eval_trunc, _ = env.step(eval_action)
+                eval_done = eval_term or eval_trunc
+                eval_frames.append(env.render())
+                eval_obs = eval_next_obs
+            
+            # Save the CLEAN gif
+            iio.mimsave(f'eval_ep{ep}.gif', eval_frames, duration=3.0)
             save_plots(scores, cvar_history)
+            
+            # Log
+            log_str = f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | Noise: {agent.current_noise:.3f}"
             if stats is not None:
                 critic_loss, actor_loss, _ = stats
-                actor_loss = actor_loss if actor_loss is not None else 0.0
-                critic_loss = critic_loss if critic_loss is not None else 0.0
-                print(f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | CVaR: {avg_cvar} | Actor Loss: {actor_loss:.4f} | Critic Loss: {critic_loss:.4f} | Noise: {agent.current_noise}")
-            else:
-                print(f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | CVaR: {avg_cvar} | Noise: {agent.current_noise}")
-        # Checkpoint
+                log_str += f" | CVaR: {avg_cvar:.3f} | ActLoss: {actor_loss:.3f} | CritLoss: {critic_loss:.3f}"
+            print(log_str)
+            
         if ep % 500 == 0:
             torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth")
 

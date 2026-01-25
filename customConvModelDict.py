@@ -22,6 +22,7 @@ class CustomConv3DModel(TorchModelV2, nn.Module):
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
         nn.Module.__init__(self)
+        
 
         # --- We must handle a Dict obs_space ---
         
@@ -31,7 +32,7 @@ class CustomConv3DModel(TorchModelV2, nn.Module):
         # The 'obs_space' object IS the Dict. Access its keys directly.
         dose_obs_shape = obs_space["dose"].shape
         # --- END FIX ---
-        
+            
         # dose_obs_shape[0] is the channel count (2)
         
         self.cnn_branch = nn.Sequential(

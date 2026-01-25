@@ -85,7 +85,7 @@ class DistributionalEnsembleCritic(nn.Module):
     Ensemble of Critics.
     Output: Z(s,a) as a categorical distribution (logits) for EACH ensemble member.
     """
-    def __init__(self, obs_shape, beam_dim, action_dim, num_atoms=51, v_min=-30, v_max=3, ensemble_size=2):
+    def __init__(self, obs_shape, beam_dim, action_dim, num_atoms=51, v_min=-5, v_max=5, ensemble_size=2):
         super().__init__()
         self.num_atoms = num_atoms
         self.v_min = v_min
@@ -212,9 +212,9 @@ class RACER:
         self.gamma = 0.99
         self.alpha_cvar = 0.10  # Risk sensitivity (0.1 = worst 10% cases)
         self.num_atoms = 51
-        self.v_min = -10.0
-        self.v_max = 10.0
-        self.batch_size = 64
+        self.v_min = -5.0
+        self.v_max = 5.0
+        self.batch_size = 32
         self.lr = 3e-4
         
         # Networks
