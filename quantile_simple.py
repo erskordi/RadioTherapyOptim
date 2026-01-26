@@ -202,7 +202,7 @@ class RACER_Quantile_PER:
         self.step_counter = 0
         self.gamma = 0.99
         self.tau = 0.005
-        self.alpha_cvar = 0.10
+        self.alpha_cvar = 0.1
         self.n_quantiles = 25
         self.batch_size = 256
         self.lr = 3e-4
@@ -389,7 +389,7 @@ if __name__ == "__main__":
                 action = env.action_space.sample()
             else:
                 action = agent.get_action(obs, explore=True)
-                agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)
+                
         
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -407,7 +407,8 @@ if __name__ == "__main__":
                 stats = None
             obs = next_obs
             episode_reward += reward
-            
+        if ep>= start_steps:
+            agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)    
         # End of Episode Stats
         scores.append(episode_reward)
         avg_cvar = (ep_cvar_accum / updates_count) if updates_count > 0 else None
@@ -442,6 +443,12 @@ if __name__ == "__main__":
             
         if ep % 500 == 0:
             torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth")
+        
+        if ep ==5000:
+            for pg in agent.actor_optimizer.param_groups:
+                pg['lr'] = 1e-4
+            for pg in agent.critic_optimizer.param_groups:
+                pg['lr'] = 1e-4
 
     print("Training Complete.")
     torch.save(agent.actor.state_dict(), "final_actor.pth")
