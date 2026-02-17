@@ -76,65 +76,132 @@ def bragg_peak_numba(depth, peak_depth, volume_length=18.0):
     return max(val, 0.0)
 
 @njit(parallel=True, fastmath=True)
-def compute_dose(volume, raster_points, direction, intensities, energy_u,
-                 volume_shape, num_layers, range_uncertainty=1.0):
+def compute_dose_numba(volume, raster_points, direction, intensities, energy_u, 
+                       volume_shape, num_layers, depth_margin):
+    """
+    The Main Kernel. 
+    Iterates over all raster points (in parallel), traces the grid, 
+    and adds dose to 'volume' in-place.
+    """
     nx, ny, nz = volume_shape
-    num_raster = len(raster_points)
-    num_threads = 8
-    
-    local_volumes = np.zeros((num_threads, nx, ny, nz), dtype=np.float32)
-    
     box_min = np.array([0.0, 0.0, 0.0])
     box_max = np.array([float(nx), float(ny), float(nz)])
-    max_range = float(max(nx, ny, nz)) * 0.8
+    num_raster = len(raster_points)
     
+    # Thread-local buffers to avoid race conditions
+    num_threads = 8
+    local_volumes = np.zeros((num_threads, nx, ny, nz), dtype=np.float32)
+    
+    # Parallel loop over thread chunks
     for t_id in prange(num_threads):
         chunk_size = (num_raster + num_threads - 1) // num_threads
         start_idx = t_id * chunk_size
         end_idx = min(start_idx + chunk_size, num_raster)
         
-        # Pre-allocate arrays for active layers (per-thread, reused per ray)
-        active_intensities = np.zeros(num_layers, dtype=np.float64)
-        active_peaks = np.zeros(num_layers, dtype=np.float64)
-        
         for i in range(start_idx, end_idx):
             p0 = raster_points[i]
             
-            t_entry, t_exit = ray_box_intersection(p0, direction, box_min, box_max)
-            if t_entry < 0:
-                continue
-            
-            # Build active layers with fixed arrays
-            num_active = 0
-            for j in range(num_layers):
-                idx = j * num_raster + i
-                if intensities[idx] > 1e-4:
-                    active_intensities[num_active] = intensities[idx]
-                    active_peaks[num_active] = energy_u[j] * max_range * range_uncertainty
-                    num_active += 1
-            
-            if num_active == 0:
-                continue
-            
-            step = 0.5
-            t = t_entry
-            
-            while t < t_exit:
-                pos = p0 + t * direction
-                vx, vy, vz = int(pos[0]), int(pos[1]), int(pos[2])
+            # 1. Ray Box Intersection
+            t_entry, t_exit = ray_box_intersection_numba(p0, direction, box_min, box_max)
+
+            if t_entry < 0 and t_exit < 0:
+                continue 
                 
-                if 0 <= vx < nx and 0 <= vy < ny and 0 <= vz < nz:
-                    depth = t - t_entry
-                    
-                    total_voxel_dose = 0.0
-                    for k in range(num_active):
-                        total_voxel_dose += active_intensities[k] * bragg_peak(depth, active_peaks[k])
-                    
-                    local_volumes[t_id, vx, vy, vz] += total_voxel_dose * step
+            d_min = t_entry + depth_margin
+            d_max = t_exit - depth_margin
+
+            if d_max <= d_min:
+                continue
                 
-                t += step
+            # 2. Voxel Traversal Setup (Amanatides & Woo simplified)
+            current_t = t_entry
+            start_pos = p0 + current_t * direction
+            
+            vx = int(np.floor(start_pos[0]))
+            vy = int(np.floor(start_pos[1]))
+            vz = int(np.floor(start_pos[2]))
+            
+            # Handle boundary cases
+            if vx == nx and direction[0] < 0: vx = nx - 1
+            if vy == ny and direction[1] < 0: vy = ny - 1
+            if vz == nz and direction[2] < 0: vz = nz - 1
+            
+            vx = max(0, min(vx, nx - 1))
+            vy = max(0, min(vy, ny - 1))
+            vz = max(0, min(vz, nz - 1))
+            
+            step_x = 1 if direction[0] >= 0 else -1
+            step_y = 1 if direction[1] >= 0 else -1
+            step_z = 1 if direction[2] >= 0 else -1
+            
+            # Calculate t_max (dist to next boundary)
+            if direction[0] == 0:
+                t_max_x = 1e30
+                t_delta_x = 1e30
+            else:
+                t_delta_x = abs(1.0 / direction[0])
+                next_bound_x = np.floor(start_pos[0]) + (1 if step_x > 0 else 0)
+                t_max_x = (next_bound_x - p0[0]) / direction[0]
+
+            if direction[1] == 0:
+                t_max_y = 1e30
+                t_delta_y = 1e30
+            else:
+                t_delta_y = abs(1.0 / direction[1])
+                next_bound_y = np.floor(start_pos[1]) + (1 if step_y > 0 else 0)
+                t_max_y = (next_bound_y - p0[1]) / direction[1]
+
+            if direction[2] == 0:
+                t_max_z = 1e30
+                t_delta_z = 1e30
+            else:
+                t_delta_z = abs(1.0 / direction[2])
+                next_bound_z = np.floor(start_pos[2]) + (1 if step_z > 0 else 0)
+                t_max_z = (next_bound_z - p0[2]) / direction[2]
+
+            # 3. Walk the grid
+            while current_t < t_exit:
+                # --- Deposit Dose ---
+                cx = float(vx) + 0.5
+                cy = float(vy) + 0.5
+                cz = float(vz) + 0.5
+
+                depth_along = (cx - p0[0])*direction[0] + (cy - p0[1])*direction[1] + (cz - p0[2])*direction[2]
+
+                if depth_along >= t_entry - 1e-6:
+                    for j in range(num_layers):
+                        idx = j * num_raster + i
+                        val_int = intensities[idx]
+                        if val_int > 1e-4:
+                            peak = d_min + energy_u[j] * (d_max - d_min)
+                            bp_val = bragg_peak_numba(depth_along, peak, 18.0)
+                            # Write to thread-local buffer (no race condition)
+                            local_volumes[t_id, vx, vy, vz] += val_int * bp_val
+
+                # --- Step ---
+                if t_max_x < t_max_y:
+                    if t_max_x < t_max_z:
+                        vx += step_x
+                        current_t = t_max_x
+                        t_max_x += t_delta_x
+                    else:
+                        vz += step_z
+                        current_t = t_max_z
+                        t_max_z += t_delta_z
+                else:
+                    if t_max_y < t_max_z:
+                        vy += step_y
+                        current_t = t_max_y
+                        t_max_y += t_delta_y
+                    else:
+                        vz += step_z
+                        current_t = t_max_z
+                        t_max_z += t_delta_z
+
+                if vx < 0 or vx >= nx or vy < 0 or vy >= ny or vz < 0 or vz >= nz:
+                    break
     
-    # Reduction (sequential, runs once after prange)
+    # Reduction: sum thread-local buffers into main volume
     for t_id in range(num_threads):
         for x in range(nx):
             for y in range(ny):
@@ -558,7 +625,7 @@ class BeamAngleEnv(gym.Env):
         if not np.any(body_mask): return 0.0 # Should not happen
         
         body_doses = dose[body_mask]
-        tolerance = 0.0te
+        tolerance = 0.0
         
         # Error = (dose - tolerance)^2, only if dose > tolerance
         diff = body_doses - tolerance

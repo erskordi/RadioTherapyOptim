@@ -10,15 +10,11 @@ import matplotlib.pyplot as plt
 import imageio as iio
 
 # Import  Numba Environment
-from Numba_Test_Train import BeamAngleEnv
+from Numba_Env import BeamAngleEnv
 
 # Check for GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using Device: {device}")
-
-# -----------------------------------------------------------
-# 1. UTILS (Prioritized Experience Replay + Plotting)
-# -----------------------------------------------------------
 
 def save_plots(scores, cvar_history, filename="learning_curves.png"):
     """
@@ -61,90 +57,86 @@ def save_plots(scores, cvar_history, filename="learning_curves.png"):
     plt.savefig(filename)
     plt.close()
 
-class SumTree:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        self.data = np.zeros(capacity, dtype=object)
-        self.write = 0
-        self.n_entries = 0
-
-    def total(self):
-        return self.tree[0]
-
-    def add(self, p, data):
-        idx = self.write + self.capacity - 1
-        self.data[self.write] = data
-        self.update(idx, p)
-        self.write += 1
-        if self.write >= self.capacity: self.write = 0
-        if self.n_entries < self.capacity: self.n_entries += 1
-
-    def update(self, idx, p):
-        change = p - self.tree[idx]
-        self.tree[idx] = p
-        while idx != 0:
-            idx = (idx - 1) // 2
-            self.tree[idx] += change
-
-    def get(self, s):
-        idx = 0
-        while True:
-            left = 2 * idx + 1
-            right = left + 1
-            if left >= len(self.tree): break
-            if s <= self.tree[left]: idx = left
-            else:
-                s -= self.tree[left]
-                idx = right
-        idx = min(idx, len(self.tree) - 1)
-        data_idx = idx - self.capacity + 1
-        return idx, self.tree[idx], self.data[data_idx]
-
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6):
-        self.tree = SumTree(capacity)
-        self.alpha = alpha
-        self.capacity = capacity
+class ReplayBuffer:
+    def __init__(self, capacity, device):
+        self.buffer = deque(maxlen=capacity)
+        self.device = device
 
     def push(self, state, action, reward, next_state, done):
-        max_p = np.max(self.tree.tree[-self.tree.capacity:])
-        if max_p == 0: max_p = 1.0
-        self.tree.add(max_p, (state, action, reward, next_state, done))
+        # We store everything as numpy arrays or floats to save memory
+        self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self, batch_size, beta=0.4):
-        batch = []
-        idxs = []
-        priorities = []
-        segment = self.tree.total() / batch_size
-
-        for i in range(batch_size):
-            a = segment * i
-            b = segment * (i + 1)
-            s = random.uniform(a, b)
-            (idx, p, data) = self.tree.get(s)
-            priorities.append(p)
-            batch.append(data)
-            idxs.append(idx)
-
-        sampling_probabilities = np.array(priorities) / self.tree.total()
-        is_weight = np.power(self.tree.n_entries * sampling_probabilities, -beta)
-        is_weight /= is_weight.max()
-
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        
+        # Unpack
         states, actions, rewards, next_states, dones = zip(*batch)
+        #returns a tuple of batch_size elements
+        
+        # Helper to stack the dictionary observations
         def stack_obs(obs_list):
-            return {"dose": np.stack([o["dose"] for o in obs_list]), "beams": np.stack([o["beams"] for o in obs_list])}
+            return {
+                "dose": torch.FloatTensor(np.stack([o["dose"] for o in obs_list])).to(self.device)
+                #"beams": torch.FloatTensor(np.stack([o["beams"] for o in obs_list])).to(self.device)
+            }
 
-        return (stack_obs(states), np.array(actions), np.array(rewards), stack_obs(next_states), np.array(dones), np.array(idxs), np.array(is_weight, dtype=np.float32))
+        return (
+            stack_obs(states),
+            torch.FloatTensor(np.array(actions)).to(self.device),
+            torch.FloatTensor(np.array(rewards)).unsqueeze(1).to(self.device),
+            stack_obs(next_states),
+            torch.FloatTensor(np.array(dones)).unsqueeze(1).to(self.device)
+        )
 
-    def update_priorities(self, idxs, errors):
-        for idx, err in zip(idxs, errors):
-            p = (abs(err) + 1e-5) ** self.alpha
-            self.tree.update(idx, p)
+    def __len__(self):
+        return len(self.buffer)
 
 # -----------------------------------------------------------
 # 2. NETWORKS
 # -----------------------------------------------------------
+
+class ResidualBlock3D(nn.Module):
+    """
+    A single residual block for 3D data.
+    Structure: Input -> ReLU -> Conv3d -> ReLU -> Conv3d -> Add Input
+    """
+    def __init__(self, channels):
+        super().__init__()
+        
+        self.conv1 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        residual = x
+        
+        
+        out = F.relu(x)
+        out = self.conv1(out)
+        out = F.relu(out)
+        out = self.conv2(out)
+        
+        return out + residual  # The Skip Connection
+
+class ImpalaBlock3D(nn.Module):
+    """
+    One stage of the IMPALA architecture.
+    Structure: Conv3d (channel adjust) -> MaxPool -> ResBlock -> ResBlock
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
+        
+        # Two residual blocks per stage (standard IMPALA configuration)
+        self.res1 = ResidualBlock3D(out_channels)
+        self.res2 = ResidualBlock3D(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pool(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
 
 class DeepResNetEncoder(nn.Module):
     def __init__(self, input_channels=2):
@@ -167,36 +159,36 @@ class DeepResNetEncoder(nn.Module):
 
 
 class EnsembleQuantileCritic(nn.Module):
-    def __init__(self, obs_shape, beam_dim, action_dim, n_quantiles=25, ensemble_size=5):
+    def __init__(self, obs_shape, action_dim, n_quantiles=25, ensemble_size=5):
         super().__init__()
         self.ensemble_size = ensemble_size
         self.n_quantiles = n_quantiles
+        #one shared encoder
         self.encoder = DeepResNetEncoder()
-        input_dim = self.encoder.flat_size + beam_dim + action_dim
+        input_dim = self.encoder.flat_size + action_dim
         self.nets = nn.ModuleList([
             nn.Sequential(nn.Linear(input_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, n_quantiles)) for _ in range(ensemble_size)
         ])
 
     def forward(self, state, action):
         img_feat = self.encoder(state["dose"])
-        beam_feat = state["beams"]
-        x = torch.cat([img_feat, beam_feat, action], dim=1)
+        #beam_feat = state["beams"]
+        x = torch.cat([img_feat, action], dim=1)
         return torch.stack([net(x) for net in self.nets], dim=1)
 
 class Actor(nn.Module):
-    def __init__(self, obs_shape, beam_dim, action_dim, action_low, action_high):
+    def __init__(self, obs_shape,  action_dim, action_low, action_high):
         super().__init__()
         self.encoder = DeepResNetEncoder()
-        input_dim = self.encoder.flat_size + beam_dim
+        input_dim = self.encoder.flat_size
         self.net = nn.Sequential(nn.Linear(input_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, action_dim))
         self.register_buffer("low", torch.tensor(action_low))
         self.register_buffer("high", torch.tensor(action_high))
 
     def forward(self, state):
         img_feat = self.encoder(state["dose"])
-        beam_feat = state["beams"]
-        x = torch.cat([img_feat, beam_feat], dim=1)
-        return torch.tanh(self.net(x))
+        #x = torch.cat([img_feat, beam_feat], dim=1)
+        return torch.tanh(self.net(img_feat))
 
 # -----------------------------------------------------------
 # 3. RACER AGENT
@@ -215,7 +207,7 @@ class RACER_Quantile_PER:
         self.batch_size = 64
         self.lr = 3e-4
         self.noise_start = 0.2
-        self.noise_end = 0.01  # Exploration floor
+        self.noise_end = 0.1  # Exploration floor
         self.noise_decay = 0.999 # Decay rate
         self.current_noise = self.noise_start
         # Store bounds as tensors for the update loop
@@ -227,27 +219,30 @@ class RACER_Quantile_PER:
         self.action_high_numpy = env.action_space.high
         
         self.obs_shape = env.observation_space["dose"].shape
-        self.beam_dim = env.observation_space["beams"].shape[0]
+        #self.beam_dim = env.observation_space["beams"].shape[0]
         self.action_dim = env.action_space.shape[0]
         
-        self.actor = Actor(self.obs_shape, self.beam_dim, self.action_dim, env.action_space.low, env.action_space.high).to(device)
-        self.critic = EnsembleQuantileCritic(self.obs_shape, self.beam_dim, self.action_dim, self.n_quantiles).to(device)
-        self.target_critic = EnsembleQuantileCritic(self.obs_shape, self.beam_dim, self.action_dim, self.n_quantiles).to(device)
+        self.actor = Actor(self.obs_shape,  self.action_dim, env.action_space.low, env.action_space.high).to(device)
+        self.target_actor = Actor(self.obs_shape,  self.action_dim, env.action_space.low, env.action_space.high).to(device)
+        self.target_actor.load_state_dict(self.actor.state_dict()) # Copy weights
+        self.critic = EnsembleQuantileCritic(self.obs_shape, self.action_dim, self.n_quantiles).to(device)
+        self.target_critic = EnsembleQuantileCritic(self.obs_shape,  self.action_dim, self.n_quantiles).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
         
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr)
         
-        self.memory = PrioritizedReplayBuffer(50000)
+        self.memory = ReplayBuffer(50000, device = device)
 
     def get_action(self, state, explore=True):
         self.actor.eval()
         dose = torch.FloatTensor(state["dose"]).to(device)
-        beams = torch.FloatTensor(state["beams"]).to(device)
-        if dose.dim() == 4: 
-            dose = dose.unsqueeze(0)   
-            beams = beams.unsqueeze(0) 
-        state_tensor = {"dose": dose, "beams": beams}
+        #beams = torch.FloatTensor(state["beams"]).to(device)
+        if dose.dim() == 4:  # [C, D, H, W] -> [1, C, D, H, W]
+            dose = dose.unsqueeze(0)
+        #if beams.dim() == 1:  # [beam_dim] -> [1, beam_dim]
+        #    beams = beams.unsqueeze(0)
+        state_tensor = {"dose": dose}
         with torch.no_grad():
             # 1. Get Normalized Action [-1, 1]
             raw_action = self.actor(state_tensor).cpu().numpy()[0]
@@ -276,56 +271,54 @@ class RACER_Quantile_PER:
 
     def update(self, per_beta=0.4):
         self.step_counter += 1
-        if self.memory.tree.n_entries < self.batch_size:
+        if len(self.memory) < self.batch_size:
             return None
             
-        states, actions, rewards, next_states, dones, idxs, weights = self.memory.sample(self.batch_size, per_beta)
+        state, action, reward, next_state, done= self.memory.sample(self.batch_size)
         
-        def to_tensor(x): return torch.FloatTensor(x).to(device)
-        s_dose = to_tensor(states["dose"]); s_beams = to_tensor(states["beams"])
-        state = {"dose": s_dose, "beams": s_beams}
-        
-        ns_dose = to_tensor(next_states["dose"]); ns_beams = to_tensor(next_states["beams"])
-        next_state = {"dose": ns_dose, "beams": ns_beams}
-        
-        act = to_tensor(actions); rew = to_tensor(rewards).unsqueeze(1)
-        done = to_tensor(dones).unsqueeze(1); per_weights = to_tensor(weights).unsqueeze(1)
-
         # Critic Update
         with torch.no_grad():
-            next_raw_action = self.actor(next_state) # Returns [-1, 1]
-            
+            #policy smoothing
+            next_raw_action = self.target_actor(next_state) # Returns [-1, 1]
+            noise = (torch.randn_like(next_raw_action) * 0.2).clamp(-0.5, 0.5)
             # Scale next_action before passing to target_critic
-            next_action = self.action_low_tensor + 0.5 * (next_raw_action + 1.0) * (self.action_high_tensor - self.action_low_tensor)
-            target_q = self.target_critic(next_state, next_action)
-            target_pooled = target_q.view(self.batch_size, -1)
-            target_Z = rew + (1 - done) * self.gamma * target_pooled
-
-        current_q = self.critic(state, act)
-        critic_loss = 0.0
-        target_Z_expanded = target_Z.unsqueeze(1) 
+            next_smooth = (next_raw_action + noise).clamp(-1.0, 1.0)
+            next_action = self.action_low_tensor + 0.5 * (next_smooth + 1.0) * (self.action_high_tensor - self.action_low_tensor)
+            # B. Truncated Target (Distributional "Min")
+            target_q = self.target_critic(next_state, next_action) # [Batch, Ensemble, N_Q]
+            target_pooled = target_q.view(self.batch_size, -1)         # [Batch, Total_Atoms]
+            sorted_z, _ = torch.sort(target_pooled, dim=1)
+        
+        # Keep bottom 80% (removes optimistic outliers)
+            n_keep = int(sorted_z.shape[1] * 0.8) 
+            target_trunc = sorted_z[:, :n_keep]
+        
+            target_Z = reward + (1 - done) * self.gamma * target_trunc # [Batch, n_keep]
+        # C. Calculate Loss
+        current_q = self.critic(state, action) # [Batch, Ensemble, N_Q]
+        
+        # Reshape for broadcasting
+        # Target: [Batch, 1, n_keep]
+        target_Z_exp = target_Z.unsqueeze(1)
+        
+        critic_loss = 0.0 
         
         for i in range(self.critic.ensemble_size):
-            pred = current_q[:, i, :].unsqueeze(2) 
-            diff = target_Z_expanded - pred
+            pred = current_q[:, i, :].unsqueeze(2) #[Batch, N_Q, 1]
+            diff = target_Z_exp - pred# [Batch, N_Q, n_keep]
             huber = torch.where(diff.abs() < 1.0, 0.5 * diff.pow(2), diff.abs() - 0.5)
             tau = (torch.arange(self.n_quantiles).float().to(device) + 0.5) / self.n_quantiles
             tau = tau.view(1, -1, 1)
             element_loss = (tau - (diff.detach() < 0).float()).abs() * huber
-            weighted_loss = element_loss.mean(dim=(1, 2)) * per_weights.squeeze()
-            critic_loss += weighted_loss.mean()
+            #weighted_loss = element_loss.mean(dim=(1, 2)) * per_weights.squeeze()
+            critic_loss += element_loss.mean()
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
-        # Update PER
-        with torch.no_grad():
-            mean_target = target_Z.mean(dim=1)
-            mean_pred = current_q.mean(dim=(1,2))
-            td_errors = (mean_target - mean_pred).abs().cpu().numpy()
-        self.memory.update_priorities(idxs, td_errors)
+        
 
         # delayed Actor Update
         if self.step_counter % self.policy_delay == 0:
@@ -339,6 +332,8 @@ class RACER_Quantile_PER:
             self.actor_optimizer.step()
         
             for tp, p in zip(self.target_critic.parameters(), self.critic.parameters()):
+                tp.data.copy_(tp.data * (1 - self.tau) + p.data * self.tau)
+            for tp, p in zip(self.target_actor.parameters(), self.actor.parameters()):
                 tp.data.copy_(tp.data * (1 - self.tau) + p.data * self.tau)
             self.last_cvar = cvar.mean().item()
             self.last_actor_loss = actor_loss.item()
@@ -386,6 +381,8 @@ if __name__ == "__main__":
                 action = env.action_space.sample()
             else:
                 action = agent.get_action(obs, explore=True)
+                agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)
+        
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             frames.append(env.render())
@@ -401,8 +398,7 @@ if __name__ == "__main__":
             
             obs = next_obs
             episode_reward += reward
-        agent.current_noise = max(agent.noise_end, agent.current_noise * agent.noise_decay)
-        
+            
         # End of Episode Stats
         scores.append(episode_reward)
         avg_cvar = (ep_cvar_accum / updates_count) if updates_count > 0 else None
@@ -411,16 +407,30 @@ if __name__ == "__main__":
         avg_score = np.mean(scores[-100:])
         
         if ep % 100 == 0:
-            iio.mimsave('eval.gif', frames, duration=1.0)
+            # [FIX] Run a dedicated EVALUATION episode (No Noise, No Training)
+            eval_obs, _ = env.reset() # Use standard or fixed config for fair comparison
+            eval_done = False
+            eval_frames = []
+            
+            while not eval_done:
+                # [FIX] explore=False ensures we see what the agent actually learned
+                eval_action = agent.get_action(eval_obs, explore=False) 
+                eval_next_obs, _, eval_term, eval_trunc, _ = env.step(eval_action)
+                eval_done = eval_term or eval_trunc
+                eval_frames.append(env.render())
+                eval_obs = eval_next_obs
+            
+            # Save the CLEAN gif
+            iio.mimsave(f'eval_ep{ep}.gif', eval_frames, duration=0.5)
             save_plots(scores, cvar_history)
+            
+            # Log
+            log_str = f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | Noise: {agent.current_noise:.3f}"
             if stats is not None:
-                actor_loss, critic_loss, _ = stats
-                actor_loss = actor_loss if actor_loss is not None else 0.0
-                critic_loss = critic_loss if critic_loss is not None else 0.0
-                print(f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | CVaR: {avg_cvar} | Actor Loss: {actor_loss:.4f} | Critic Loss: {critic_loss:.4f} | Noise: {agent.current_noise}")
-            else:
-                print(f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | CVaR: {avg_cvar} | Noise: {agent.current_noise}")
-        # Checkpoint
+                critic_loss, actor_loss, _ = stats
+                log_str += f" | CVaR: {avg_cvar:.3f} | ActLoss: {actor_loss:.3f} | CritLoss: {critic_loss:.3f}"
+            print(log_str)
+            
         if ep % 500 == 0:
             torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth")
 
