@@ -432,7 +432,7 @@ if __name__ == "__main__":
             print(log_str)
             
         if ep % 500 == 0:
-            torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth", file_name=f"{SAVE_DIR}/actor_ep{ep}.pth")
+            torch.save(agent.actor.state_dict(), f"{SAVE_DIR}/actor_ep{ep}.pth")
         
         if ep ==5000:
             for pg in agent.actor_optimizer.param_groups:
@@ -441,5 +441,5 @@ if __name__ == "__main__":
                 pg['lr'] = 1e-4
 
     print("Training Complete.")
-    torch.save(agent.actor.state_dict(), "final_actor.pth", file_name=f"{SAVE_DIR}/final_actor.pth")
+    torch.save(agent.actor.state_dict(), f"{SAVE_DIR}/final_actor.pth")
     save_plots(scores, cvar_history, filename=f"{SAVE_DIR}/final_learning_curves.png")
