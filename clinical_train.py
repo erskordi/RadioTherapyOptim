@@ -181,7 +181,7 @@ class Actor(nn.Module):
         self.register_buffer("high", torch.tensor(action_high))
 
     def forward(self, state):
-        x = self.encoder(state["dose"])
+        x = self.encoder(state)
         return torch.tanh(self.net(x))
 
 # -----------------------------------------------------------
