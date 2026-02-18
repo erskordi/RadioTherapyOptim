@@ -339,7 +339,8 @@ class RACER_Quantile_PER:
 # -----------------------------------------------------------
 # 4. MAIN TRAINING LOOP
 # -----------------------------------------------------------
-
+SAVE_DIR = "clinical"
+os.makedirs(SAVE_DIR, exist_ok=True)
 if __name__ == "__main__":
     voi_configs18 = [
         ((6, 6, 6), 0.5, (3, 3, 3)), ((12, 12, 12), 0.8, (3, 3, 3)), ((9, 4, 9), 0.6, (3, 3, 3)),
@@ -420,8 +421,8 @@ if __name__ == "__main__":
                 eval_obs = eval_next_obs
             
             # Save the CLEAN gif
-            iio.mimsave(f'eval_ep{ep}.gif', eval_frames, duration=3.0)
-            save_plots(scores, cvar_history)
+            iio.mimsave(f'{SAVE_DIR}/eval_ep{ep}.gif', eval_frames, duration=3.0)
+            #save_plots(scores, cvar_history, filename=f'{SAVE_DIR}/learning_curves_ep{ep}.png')
             
             # Log
             log_str = f"Ep {ep} | Reward: {episode_reward:.2f} | Avg100: {avg_score:.2f} | Noise: {agent.current_noise:.3f}"
@@ -431,7 +432,7 @@ if __name__ == "__main__":
             print(log_str)
             
         if ep % 500 == 0:
-            torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth")
+            torch.save(agent.actor.state_dict(), f"actor_ep{ep}.pth", file_name=f"{SAVE_DIR}/actor_ep{ep}.pth")
         
         if ep ==5000:
             for pg in agent.actor_optimizer.param_groups:
@@ -440,5 +441,5 @@ if __name__ == "__main__":
                 pg['lr'] = 1e-4
 
     print("Training Complete.")
-    torch.save(agent.actor.state_dict(), "final_actor.pth")
-    save_plots(scores, cvar_history)
+    torch.save(agent.actor.state_dict(), "final_actor.pth", file_name=f"{SAVE_DIR}/final_actor.pth")
+    save_plots(scores, cvar_history, filename=f"{SAVE_DIR}/final_learning_curves.png")
