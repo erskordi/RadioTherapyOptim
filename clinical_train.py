@@ -212,7 +212,7 @@ class RACER_Quantile_PER:
         self.action_low_numpy = env.action_space.low
         self.action_high_numpy = env.action_space.high
         
-        self.obs_shape = env.observation_space["dose"].shape
+        self.obs_shape = env.observation_space.shape
         self.action_dim = env.action_space.shape[0]
         
         self.actor = Actor(self.obs_shape, self.action_dim, env.action_space.low, env.action_space.high).to(device)
