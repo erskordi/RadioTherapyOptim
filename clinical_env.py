@@ -1,595 +1,82 @@
 """
-Clinical Radiotherapy Evaluation Environment
-
-Features:
-1. Realistic anatomical scenarios (head & neck, prostate, lung)
-2. OAR priority levels (serial vs parallel organs)
-3. Clinical DVH constraints (D95, Dmax, V20, etc.)
-4. Proper clinical metrics for evaluation
-5. Clinical-style visualization (coverage + constraint violations)
-
-OAR Types:
-- Serial organs (spinal cord, brainstem): MAX dose matters - any hot spot is critical
-- Parallel organs (lung, liver, kidney): MEAN dose and volume constraints
+Sequential, multi-beam radiotherapy environment for reinforcement learning.
+OPTIMIZED VERSION: Uses Numba for fast dose calculation and includes collision detection.
 """
-
+import random
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-import matplotlib.patches as mpatches
-from mpl_toolkits.mplot3d import Axes3D
-from io import BytesIO
 import gymnasium as gym
 from gymnasium import spaces
+import imageio as iio
+from io import BytesIO
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
+# --- NUMBA IMPORTS ---
 from numba import njit, prange
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-import json
-
 
 # -----------------------
-# DATA STRUCTURES
-# -----------------------
-def perturb_scenario(scenario, volume_shape, max_shift=2, tolerance_noise=0.0, rng=None):
-    """
-    Randomizes a clinical scenario while preventing overlaps.
-    
-    Args:
-        scenario: Dict with "target" and "oars" from scenario creator
-        volume_shape: Tuple (nx, ny, nz)
-        max_shift: Maximum voxel shift in any direction
-        tolerance_noise: Std dev for perturbing dose tolerances (0 to disable)
-        rng: numpy random generator
-    
-    Returns:
-        New scenario dict with perturbed positions and tolerances
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    
-    volume_shape = np.array(volume_shape)
-    
-    def clamp_center(center, size):
-        """Clamp center so box stays within volume."""
-        center = np.array(center, dtype=int)
-        size = np.array(size, dtype=int)
-        half = size // 2
-        low = half
-        high = volume_shape - (size - half)
-        return tuple(np.clip(center, low, high - 1))
-    
-    def boxes_intersect(c1, s1, c2, s2, margin=0):
-        """Check if two boxes intersect (with optional margin)."""
-        for i in range(3):
-            min1 = c1[i] - s1[i] // 2 - margin
-            max1 = min1 + s1[i] + 2 * margin
-            min2 = c2[i] - s2[i] // 2
-            max2 = min2 + s2[i]
-            if max1 <= min2 or max2 <= min1:
-                return False
-        return True
-    
-    def perturb_constraint(constraint, tolerance_noise, rng):
-        """Create a copy of constraint with perturbed tolerances."""
-        if tolerance_noise <= 0:
-            return constraint
-        
-        # Create new constraint with same type
-        if isinstance(constraint, TargetConstraint):
-            return TargetConstraint(
-                name=constraint.name,
-                prescription_dose=constraint.prescription_dose,
-                d95_min=constraint.d95_min,
-                d5_max=constraint.d5_max,
-                v100_min=constraint.v100_min
-            )
-        elif isinstance(constraint, OARConstraint):
-            # Perturb dose limits slightly (within ±tolerance_noise relative)
-            def perturb_val(val):
-                if val is None:
-                    return None
-                noise = 1.0 + rng.normal(0, tolerance_noise)
-                return float(np.clip(val * noise, 0.01, 10.0))
-            
-            new_v_dose = None
-            if constraint.v_dose is not None:
-                dose_thresh, vol_limit = constraint.v_dose
-                new_v_dose = (perturb_val(dose_thresh), vol_limit)  # Keep volume % fixed
-            
-            return OARConstraint(
-                name=constraint.name,
-                priority=constraint.priority,
-                organ_type=constraint.organ_type,
-                max_dose=perturb_val(constraint.max_dose),
-                mean_dose=perturb_val(constraint.mean_dose),
-                d2_limit=perturb_val(constraint.d2_limit),
-                v_dose=new_v_dose,
-                color=constraint.color
-            )
-        return constraint
-    
-    # 1. Place Target first
-    target_info = scenario["target"]
-    target_center = np.array(target_info["center"], dtype=int)
-    target_size = np.array(target_info["size"], dtype=int)
-    
-    shift = rng.integers(-max_shift, max_shift + 1, size=3)
-    new_target_center = clamp_center(target_center + shift, target_size)
-    
-    new_target = {
-        "center": new_target_center,
-        "size": tuple(target_size),
-        "constraint": perturb_constraint(target_info["constraint"], 0, rng)  # Don't perturb target
-    }
-    
-    # 2. Place OARs with collision detection
-    new_oars = []
-    placed_boxes = [(new_target_center, target_size)]  # Start with target
-    
-    for oar_info in scenario["oars"]:
-        oar_center = np.array(oar_info["center"], dtype=int)
-        oar_size = np.array(oar_info["size"], dtype=int)
-        
-        # Try to find non-overlapping position
-        best_center = None
-        for attempt in range(15):
-            shift = rng.integers(-max_shift, max_shift + 1, size=3)
-            candidate = clamp_center(oar_center + shift, oar_size)
-            
-            # Check collisions with all placed structures
-            collision = False
-            for (placed_c, placed_s) in placed_boxes:
-                if boxes_intersect(candidate, oar_size, placed_c, placed_s, margin=1):
-                    collision = True
-                    break
-            
-            if not collision:
-                best_center = candidate
-                break
-        
-        # Fallback: use original position if no valid spot found
-        if best_center is None:
-            best_center = clamp_center(oar_center, oar_size)
-        
-        placed_boxes.append((best_center, oar_size))
-        
-        new_oars.append({
-            "center": best_center,
-            "size": tuple(oar_size),
-            "constraint": perturb_constraint(oar_info["constraint"], tolerance_noise, rng)
-        })
-    
-    return {
-        "target": new_target,
-        "oars": new_oars,
-        "name": scenario["name"]
-    }
-@dataclass
-class OARConstraint:
-    """Clinical constraint for an Organ at Risk."""
-    name: str
-    priority: str  # "critical", "high", "medium", "low"
-    organ_type: str  # "serial" or "parallel"
-    
-    # Dose constraints (at least one should be set)
-    max_dose: Optional[float] = None      # Dmax: No voxel should exceed this
-    mean_dose: Optional[float] = None     # Dmean: Average dose limit
-    d2_limit: Optional[float] = None      # D2%: Dose to hottest 2% of volume
-    v_dose: Optional[Tuple[float, float]] = None  # (dose, volume%): e.g., V20 < 30%
-    
-    # Visualization
-    color: str = "blue"
-    
-    def evaluate(self, doses: np.ndarray) -> Dict:
-        """Evaluate all constraints for this OAR."""
-        results = {
-            "name": self.name,
-            "priority": self.priority,
-            "violations": [],
-            "metrics": {},
-            "passed": True
-        }
-        
-        if len(doses) == 0:
-            return results
-        
-        # Dmax constraint
-        if self.max_dose is not None:
-            actual_max = np.max(doses)
-            results["metrics"]["Dmax"] = actual_max
-            if actual_max > self.max_dose:
-                results["violations"].append(f"Dmax: {actual_max:.2f} > {self.max_dose:.2f}")
-                results["passed"] = False
-        
-        # Dmean constraint
-        if self.mean_dose is not None:
-            actual_mean = np.mean(doses)
-            results["metrics"]["Dmean"] = actual_mean
-            if actual_mean > self.mean_dose:
-                results["violations"].append(f"Dmean: {actual_mean:.2f} > {self.mean_dose:.2f}")
-                results["passed"] = False
-        
-        # D2% constraint (near-max dose)
-        if self.d2_limit is not None:
-            d2 = np.percentile(doses, 98)
-            results["metrics"]["D2%"] = d2
-            if d2 > self.d2_limit:
-                results["violations"].append(f"D2%: {d2:.2f} > {self.d2_limit:.2f}")
-                results["passed"] = False
-        
-        # Volume constraint (e.g., V20 < 30%)
-        if self.v_dose is not None:
-            dose_threshold, volume_limit = self.v_dose
-            volume_fraction = np.mean(doses >= dose_threshold) * 100
-            results["metrics"][f"V{int(dose_threshold*100)}"] = volume_fraction
-            if volume_fraction > volume_limit:
-                results["violations"].append(
-                    f"V{int(dose_threshold*100)}: {volume_fraction:.1f}% > {volume_limit:.1f}%"
-                )
-                results["passed"] = False
-        
-        return results
-
-
-@dataclass 
-class TargetConstraint:
-    """Clinical constraint for target (tumor)."""
-    name: str
-    prescription_dose: float = 1.0
-    
-    # Coverage requirements
-    d95_min: float = 0.95      # D95 >= 95% of prescription
-    d5_max: float = 1.07       # D5 <= 107% (hot spot limit)
-    v100_min: float = 0.95     # V100 >= 95% (coverage)
-    
-    def evaluate(self, doses: np.ndarray) -> Dict:
-        """Evaluate target coverage."""
-        results = {
-            "name": self.name,
-            "metrics": {},
-            "violations": [],
-            "passed": True,
-            "coverage": 0.0
-        }
-        
-        if len(doses) == 0:
-            results["passed"] = False
-            return results
-        
-        rx = self.prescription_dose
-        
-        # D95: Dose covering 95% of target
-        d95 = np.percentile(doses, 5)
-        results["metrics"]["D95"] = d95
-        if d95 < self.d95_min * rx:
-            results["violations"].append(f"D95: {d95:.2f} < {self.d95_min * rx:.2f}")
-            results["passed"] = False
-        
-        # D5: Dose to hottest 5% (hot spot)
-        d5 = np.percentile(doses, 95)
-        results["metrics"]["D5"] = d5
-        if d5 > self.d5_max * rx:
-            results["violations"].append(f"D5: {d5:.2f} > {self.d5_max * rx:.2f}")
-            results["passed"] = False
-        
-        # V100: Volume receiving prescription dose
-        v100 = np.mean(doses >= rx) * 100
-        results["metrics"]["V100"] = v100
-        results["coverage"] = v100
-        if v100 < self.v100_min * 100:
-            results["violations"].append(f"V100: {v100:.1f}% < {self.v100_min * 100:.1f}%")
-            results["passed"] = False
-        
-        # Additional useful metrics
-        results["metrics"]["Dmin"] = np.min(doses)
-        results["metrics"]["Dmax"] = np.max(doses)
-        results["metrics"]["Dmean"] = np.mean(doses)
-        results["metrics"]["HI"] = (d5 - d95) / np.mean(doses)  # Homogeneity Index
-        
-        return results
-
-
-# -----------------------
-# CLINICAL SCENARIOS
-# -----------------------
-
-def create_head_neck_scenario(volume_shape=(18, 18, 18)):
-    """
-    Head & Neck cancer scenario.
-    
-    Challenging due to many critical OARs surrounding the target:
-    - Spinal cord (serial, critical)
-    - Brainstem (serial, critical)  
-    - Parotid glands (parallel, for quality of life)
-    - Optic structures (serial, critical)
-    """
-    center = np.array(volume_shape) // 2
-    
-    target = {
-        "center": tuple(center),
-        "size": (4, 4, 4),
-        "constraint": TargetConstraint(
-            name="Nasopharynx Tumor",
-            prescription_dose=1.0,
-            d95_min=0.95,
-            v100_min=0.95
-        )
-    }
-    
-    oars = [
-        {
-            "center": (center[0], center[1] - 4, center[2]),
-            "size": (2, 2, 10),
-            "constraint": OARConstraint(
-                name="Spinal Cord",
-                priority="critical",
-                organ_type="serial",
-                max_dose=0.45,  # 45 Gy equivalent
-                d2_limit=0.50,
-                color="red"
-            )
-        },
-        {
-            "center": (center[0], center[1] + 3, center[2] + 2),
-            "size": (3, 3, 3),
-            "constraint": OARConstraint(
-                name="Brainstem",
-                priority="critical", 
-                organ_type="serial",
-                max_dose=0.54,
-                color="darkred"
-            )
-        },
-        {
-            "center": (center[0] - 5, center[1], center[2]),
-            "size": (2, 3, 3),
-            "constraint": OARConstraint(
-                name="Left Parotid",
-                priority="high",
-                organ_type="parallel",
-                mean_dose=0.26,
-                color="orange"
-            )
-        },
-        {
-            "center": (center[0] + 5, center[1], center[2]),
-            "size": (2, 3, 3),
-            "constraint": OARConstraint(
-                name="Right Parotid",
-                priority="high",
-                organ_type="parallel",
-                mean_dose=0.26,
-                color="orange"
-            )
-        },
-        {
-            "center": (center[0], center[1] + 5, center[2] + 3),
-            "size": (2, 2, 2),
-            "constraint": OARConstraint(
-                name="Optic Chiasm",
-                priority="critical",
-                organ_type="serial",
-                max_dose=0.54,
-                color="purple"
-            )
-        }
-    ]
-    
-    return {"target": target, "oars": oars, "name": "Head & Neck"}
-
-
-def create_prostate_scenario(volume_shape=(18, 18, 18)):
-    """
-    Prostate cancer scenario.
-    
-    OARs:
-    - Rectum (serial/parallel, posterior)
-    - Bladder (parallel, superior)
-    - Femoral heads (parallel, lateral)
-    """
-    center = np.array(volume_shape) // 2
-    
-    target = {
-        "center": tuple(center),
-        "size": (4, 4, 3),
-        "constraint": TargetConstraint(
-            name="Prostate",
-            prescription_dose=1.0,
-            d95_min=0.95,
-            v100_min=0.95
-        )
-    }
-    
-    oars = [
-        {
-            "center": (center[0], center[1] - 3, center[2]),
-            "size": (3, 2, 5),
-            "constraint": OARConstraint(
-                name="Rectum",
-                priority="high",
-                organ_type="parallel",
-                max_dose=0.75,
-                mean_dose=0.50,
-                v_dose=(0.70, 25.0),  # V70 < 25%
-                color="brown"
-            )
-        },
-        {
-            "center": (center[0], center[1] + 4, center[2]),
-            "size": (4, 3, 5),
-            "constraint": OARConstraint(
-                name="Bladder",
-                priority="medium",
-                organ_type="parallel",
-                mean_dose=0.45,
-                v_dose=(0.65, 50.0),  # V65 < 50%
-                color="yellow"
-            )
-        },
-        {
-            "center": (center[0] - 5, center[1], center[2] - 2),
-            "size": (3, 3, 3),
-            "constraint": OARConstraint(
-                name="Left Femoral Head",
-                priority="low",
-                organ_type="parallel",
-                max_dose=0.50,
-                color="cyan"
-            )
-        },
-        {
-            "center": (center[0] + 5, center[1], center[2] - 2),
-            "size": (3, 3, 3),
-            "constraint": OARConstraint(
-                name="Right Femoral Head",
-                priority="low",
-                organ_type="parallel",
-                max_dose=0.50,
-                color="cyan"
-            )
-        }
-    ]
-    
-    return {"target": target, "oars": oars, "name": "Prostate"}
-
-
-def create_lung_scenario(volume_shape=(18, 18, 18)):
-    """
-    Lung cancer scenario (SBRT-style).
-    
-    Challenging due to:
-    - Small target
-    - Surrounding critical structures
-    - Need for steep dose gradients
-    """
-    center = np.array(volume_shape) // 2
-    # Offset target to one side (more realistic lung tumor position)
-    target_center = (center[0] - 3, center[1], center[2])
-    
-    target = {
-        "center": target_center,
-        "size": (3, 3, 3),
-        "constraint": TargetConstraint(
-            name="Lung Tumor",
-            prescription_dose=1.0,
-            d95_min=0.95,
-            d5_max=1.10,  # Allow slightly hotter for SBRT
-            v100_min=0.95
-        )
-    }
-    
-    oars = [
-        {
-            "center": (center[0] + 2, center[1], center[2]),
-            "size": (2, 2, 12),
-            "constraint": OARConstraint(
-                name="Spinal Cord",
-                priority="critical",
-                organ_type="serial",
-                max_dose=0.20,  # Very strict for SBRT
-                color="red"
-            )
-        },
-        {
-            "center": (center[0] + 3, center[1], center[2]),
-            "size": (3, 4, 6),
-            "constraint": OARConstraint(
-                name="Heart",
-                priority="high",
-                organ_type="parallel",
-                max_dose=0.30,
-                mean_dose=0.10,
-                color="pink"
-            )
-        },
-        {
-            "center": (center[0] + 1, center[1], center[2] + 3),
-            "size": (2, 3, 3),
-            "constraint": OARConstraint(
-                name="Esophagus",
-                priority="high",
-                organ_type="serial",
-                max_dose=0.35,
-                color="green"
-            )
-        },
-        {
-            "center": (center[0] - 4, center[1], center[2]),
-            "size": (6, 8, 10),
-            "constraint": OARConstraint(
-                name="Healthy Lung",
-                priority="medium",
-                organ_type="parallel",
-                mean_dose=0.08,
-                v_dose=(0.20, 30.0),  # V20 < 30%
-                color="lightblue"
-            )
-        },
-        {
-            "center": (center[0], center[1] + 5, center[2]),
-            "size": (3, 2, 4),
-            "constraint": OARConstraint(
-                name="Great Vessels",
-                priority="high",
-                organ_type="serial",
-                max_dose=0.40,
-                color="darkblue"
-            )
-        }
-    ]
-    
-    return {"target": target, "oars": oars, "name": "Lung SBRT"}
-
-
-# -----------------------
-# NUMBA KERNELS
+# 1. NUMBA KERNELS (Fast Math)
 # -----------------------
 
 @njit(fastmath=True)
-def ray_box_intersection(p0, d, box_min, box_max):
-    tmin, tmax = -1e30, 1e30
+def ray_box_intersection_numba(p0, d, box_min, box_max):
+    """
+    Calculates t_entry and t_exit for a ray entering a box.
+    Returns (-1.0, -1.0) if no intersection.
+    """
+    tmin = -1e30 # Representing -inf
+    tmax = 1e30  # Representing +inf
+    
     for i in range(3):
         if abs(d[i]) < 1e-9:
+            # Ray parallel to axis
             if p0[i] < box_min[i] or p0[i] > box_max[i]:
                 return -1.0, -1.0
         else:
             inv_d = 1.0 / d[i]
             t1 = (box_min[i] - p0[i]) * inv_d
             t2 = (box_max[i] - p0[i]) * inv_d
+            
             if t1 < t2:
-                tmin = max(tmin, t1)
-                tmax = min(tmax, t2)
+                if t1 > tmin: tmin = t1
+                if t2 < tmax: tmax = t2
             else:
-                tmin = max(tmin, t2)
-                tmax = min(tmax, t1)
+                if t2 > tmin: tmin = t2
+                if t1 < tmax: tmax = t1
+                
     if tmin > tmax or tmax < 0:
         return -1.0, -1.0
+        
     return max(tmin, 0.0), tmax
 
-
 @njit(fastmath=True)
-def bragg_peak(depth, peak_depth):
-    """Bragg peak with range straggling."""
-    sigma_base = 0.3
-    sigma = sigma_base * (1.0 + 0.05 * np.sqrt(max(peak_depth, 1.0)))
+def bragg_peak_numba(depth, peak_depth, volume_length=18.0):
+    # Hardcoded parameters for speed 
+    width_pre = (volume_length * 6.0) / 250.0
+    width_post = (volume_length * 1.8) / 250.0
+    entrance_scale = 0.2
+    tail_scale = 0.05
     
-    entrance = 0.25
+    if depth < 0.0: depth = 0.0
+    
+    val = 0.0
     diff = depth - peak_depth
     
-    if depth < 0:
-        return 0.0
-    elif depth <= peak_depth:
-        sigma_rise = peak_depth * 0.25
-        rise = np.exp(-diff**2 / (2 * sigma_rise**2))
-        return entrance + (1.0 - entrance) * rise
+    if depth <= peak_depth:
+        # Rise component
+        rise = np.exp(-(diff * diff) / (2.0 * width_pre * width_pre))
+        val = entrance_scale + (rise * (1.0 - entrance_scale))
     else:
-        fall = np.exp(-diff**2 / (2 * sigma**2))
-        tail = 0.03 * np.exp(-diff / (sigma * 2))
-        return fall * 0.97 + tail
+        # Fall component
+        fall = np.exp(-(diff * diff) / (2.0 * width_post * width_post))
+        tail = tail_scale * np.exp(-diff / (width_post * 1.5))
+        val = (fall * (1.0 - tail_scale)) + tail
 
+    return max(val, 0.0)
 
 @njit(parallel=True, fastmath=True)
-def compute_dose(volume, raster_points, direction, intensities, energy_u, 
+def compute_dose_numba(volume, raster_points, direction, intensities, energy_u, 
                        volume_shape, num_layers, depth_margin):
     """
     The Main Kernel. 
@@ -615,7 +102,7 @@ def compute_dose(volume, raster_points, direction, intensities, energy_u,
             p0 = raster_points[i]
             
             # 1. Ray Box Intersection
-            t_entry, t_exit = ray_box_intersection(p0, direction, box_min, box_max)
+            t_entry, t_exit = ray_box_intersection_numba(p0, direction, box_min, box_max)
 
             if t_entry < 0 and t_exit < 0:
                 continue 
@@ -687,7 +174,7 @@ def compute_dose(volume, raster_points, direction, intensities, energy_u,
                         val_int = intensities[idx]
                         if val_int > 1e-4:
                             peak = d_min + energy_u[j] * (d_max - d_min)
-                            bp_val = bragg_peak(depth_along, peak)
+                            bp_val = bragg_peak_numba(depth_along, peak, 18.0)
                             # Write to thread-local buffer (no race condition)
                             local_volumes[t_id, vx, vy, vz] += val_int * bp_val
 
@@ -722,11 +209,13 @@ def compute_dose(volume, raster_points, direction, intensities, energy_u,
                     volume[x, y, z] += local_volumes[t_id, x, y, z]
 
 # -----------------------
-# BEAM CLASS
+# 2. UTILITY & GEOMETRY
 # -----------------------
 
-def orthonormal_basis(v):
-    v = v / (np.linalg.norm(v) + 1e-12)
+def orthonormal_plane_basis(v):
+    v = np.asarray(v, dtype=float)
+    if np.allclose(v, 0):
+        raise ValueError("zero direction")
     if abs(v[0]) < 0.9:
         a = np.array([1.0, 0.0, 0.0])
     else:
@@ -734,642 +223,549 @@ def orthonormal_basis(v):
     u = a - v * np.dot(a, v)
     u = u / (np.linalg.norm(u) + 1e-12)
     w = np.cross(v, u)
+    w = w / (np.linalg.norm(w) + 1e-12)
     return u, w
 
+def clamp_center(center, size, volume_shape):
+    clamped = []
+    for i in range(3):
+        half = size[i] // 2
+        low = half
+        high = volume_shape[i] - (size[i] - half)
+        c = int(round(center[i]))
+        c = max(low, min(high, c))
+        clamped.append(c)
+    return tuple(clamped)
 
+def boxes_intersect(c1, s1, c2, s2):
+    """
+    Check if two 3D boxes intersect.
+    c: center (x,y,z), s: size (w,h,d)
+    Uses simple AABB logic (assuming axis aligned for safety check)
+    """
+    for i in range(3):
+        # Calculate min and max for both boxes
+        min1 = c1[i] - s1[i]//2
+        max1 = min1 + s1[i]
+        min2 = c2[i] - s2[i]//2
+        max2 = min2 + s2[i]
+        
+        # If disjoint in any dimension, they don't intersect
+        if max1 <= min2 or max2 <= min1:
+            return False
+    return True
+
+def perturb_config(base_config, volume_shape, max_shift=1, rng=None):
+    """
+    Randomizes the scene configuration while preventing overlaps.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # 1. Place Target
+    tcenter = np.array(base_config["target_center"], dtype=int)
+    tsize = base_config["target_size"]
+    shift = rng.integers(-max_shift, max_shift+1, size=3)
+    new_tcenter = clamp_center(tcenter + shift, tsize, volume_shape)
+    
+    # 2. Place VOIs with Collision Check
+    new_vois = []
+    
+    for (c, w, size) in base_config["vois"]:
+        c = np.array(c, dtype=int)
+        
+        # Try to find a non-overlapping position (max 10 attempts)
+        valid_pos = False
+        final_c = c
+        
+        for _ in range(10): 
+            shift = rng.integers(-max_shift, max_shift+1, size=3)
+            candidate_c = clamp_center(c + shift, size, volume_shape)
+            
+            # Check collision with Target
+            if boxes_intersect(new_tcenter, tsize, candidate_c, size):
+                continue
+            
+            # Check collision with already placed VOIs
+            collision_with_other = False
+            for (existing_c, _, existing_size) in new_vois:
+                if boxes_intersect(existing_c, existing_size, candidate_c, size):
+                    collision_with_other = True
+                    break
+            if collision_with_other:
+                continue
+
+            valid_pos = True
+            final_c = candidate_c
+            break
+        
+        # If valid_pos is False, we use the last candidate but it might overlap.
+        # Ideally, we fall back to original C or just accept it.
+        # Here we use final_c which is the last attempted position.
+
+        #w_new = float(np.clip(w + rng.normal(scale=0.05), 0.05, 10.0)) don't perturb constraints
+        new_vois.append((final_c, w, size))
+
+    return {
+        "target_center": tuple(new_tcenter),
+        "target_size": tuple(tsize),
+        "vois": new_vois,
+    }
+
+# -----------------------
+# 3. BEAM CLASS
+# -----------------------
 class Beam:
-    def __init__(self, gantry, elevation, raster_grid, raster_spacing,
-                 volume_shape, isocenter, setup_error=None):
-        self.volume_shape = volume_shape
-        self.isocenter = np.array(isocenter, dtype=float) + 0.5
+    def __init__(self, gantry_angle, couch_angle, raster_grid_size, raster_spacing, volume_shape):
+        self.gantry_angle = float(gantry_angle)
+        self.couch_angle = float(couch_angle)
+        self.raster_grid_size = tuple(map(int, raster_grid_size))
+        self.raster_spacing = tuple(map(float, raster_spacing))
+        self.volume_shape = tuple(map(int, volume_shape))
+        self.volume_center = np.array(self.volume_shape, dtype=float) // 2.0 + 0.5
+        self.source_distance = self.volume_shape[0]//2 + 1
+        self.direction = self._angles_to_direction(self.gantry_angle, self.couch_angle)
+        self.source_point = self.get_source_point()
+        self.raster_points = self.get_raster_points(center=self.source_point)
+
+    def get_source_point(self):
+        return self.volume_center - self.source_distance * self.direction
+    
+    def _angles_to_direction(self, gantry, elevation): 
+        """
+        gantry: azimuth in xy-plane [-π, π]
+        elevation: angle from xy-plane [-π/2, π/2]
+    
+        elevation = 0 → horizontal beam (in xy-plane)
+        elevation = π/2 → beam pointing up
+        elevation = -π/2 → beam pointing down
+        """
+        x = np.cos(elevation) * np.cos(gantry) 
+        y = np.cos(elevation) * np.sin(gantry) 
+        z = np.sin(elevation) 
+        v = np.array([x, y, z], dtype=float) 
+        v /= np.linalg.norm(v) + 1e-12
+        return -v
+    
+    def get_raster_points(self, center=None):
+        # Re-using the numba intersection for setup is fine, or simple math
+        # We'll stick to python here as it runs once per step
+        box_min = np.array([0, 0, 0], dtype=float)
+        box_max = np.array(self.volume_shape, dtype=float)
         
-        if setup_error is not None:
-            self.isocenter += np.array(setup_error)
-        
-        cos_el = np.cos(elevation)
-        direction = np.array([
-            -cos_el * np.cos(gantry),
-            -cos_el * np.sin(gantry),
-            -np.sin(elevation)
-        ])
-        self.direction = direction / (np.linalg.norm(direction) + 1e-12)
-        
-        self.source_distance = np.linalg.norm(volume_shape) / 2 + 5
-        self.source_point = self.isocenter - self.source_distance * self.direction
-        
-        # Create raster points
-        box_min = np.zeros(3)
-        box_max = np.array(volume_shape, dtype=float)
-        t_entry, _ = ray_box_intersection(self.source_point, self.direction, box_min, box_max)
+        # We can call the numba version here too, just need to handle tuple return
+        t_entry, _ = ray_box_intersection_numba(self.source_point, self.direction, box_min, box_max)
         
         if t_entry >= 0:
             plane_center = self.source_point + t_entry * self.direction
         else:
-            plane_center = self.isocenter
-        
-        ny, nx = raster_grid
-        sy, sx = raster_spacing
-        u, w = orthonormal_basis(self.direction)
-        
-        y_off = (np.arange(ny) - (ny-1)/2) * sy
-        x_off = (np.arange(nx) - (nx-1)/2) * sx
-        xx, yy = np.meshgrid(x_off, y_off)
-        
-        pts = plane_center + xx[..., None] * u + yy[..., None] * w
-        self.raster_points = pts.reshape(-1, 3)
+            plane_center = self.volume_center
+        center = np.asarray(plane_center, dtype=float)
 
+        ny, nx = self.raster_grid_size
+        sy, sx = self.raster_spacing
+
+        u, v = orthonormal_plane_basis(self.direction)
+
+        y_idxs = (np.arange(ny) - (ny - 1) / 2.0)
+        x_idxs = (np.arange(nx) - (nx - 1) / 2.0)
+        x_offsets = x_idxs * sx
+        y_offsets = y_idxs * sy
+        xx, yy = np.meshgrid(x_offsets, y_offsets, indexing="xy")
+
+        pts = center.reshape((1, 1, 3)) + np.expand_dims(xx, axis=2) * u.reshape((1, 1, 3)) + np.expand_dims(yy, axis=2) * v.reshape((1, 1, 3))
+        pts = pts.reshape((-1, 3))
+        return pts
+
+    def apply_dose(self, volume, intensities, energy_u, num_raster_points, depth_margin=0.5):
+        """
+        Calls the Numba kernel for high-speed dose deposition.
+        """
+        # Ensure contiguous arrays and correct types for C-level speed
+        raster_pts_arr = np.ascontiguousarray(self.raster_points, dtype=np.float64)
+        dir_arr = np.ascontiguousarray(self.direction, dtype=np.float64)
+        ints_arr = np.ascontiguousarray(intensities, dtype=np.float64)
+        energies_arr = np.ascontiguousarray(energy_u, dtype=np.float64)
+        shape_arr = np.array(self.volume_shape, dtype=np.int64)
+        
+        # Numba function modifies 'volume' in-place
+        compute_dose_numba(
+            volume, 
+            raster_pts_arr, 
+            dir_arr, 
+            ints_arr, 
+            energies_arr, 
+            shape_arr,
+            len(energy_u),
+            float(depth_margin)
+        )
+            
+        return volume, self.raster_points, self.source_point
 
 # -----------------------
-# CLINICAL ENVIRONMENT
+# 4. GYM ENVIRONMENT
 # -----------------------
-
-class ClinicalRadiotherapyEnv(gym.Env):
-    """
-    Radiotherapy environment with clinical constraints and evaluation.
-    
-    Features:
-    - Multiple clinical scenarios (head & neck, prostate, lung)
-    - Realistic OAR constraints (Dmax, Dmean, DVH)
-    - Clinical metrics (D95, V100, HI)
-    - Uncertainty modeling (range, setup)
-    - Clinical-style visualization
-    """
-    
-    SCENARIOS = {
-        "head_neck": create_head_neck_scenario,
-        "prostate": create_prostate_scenario,
-        "lung": create_lung_scenario
-    }
-    
+class BeamAngleEnv(gym.Env):
     def __init__(self, config):
         super().__init__()
+        self.config = config
+        self.volume_shape = self.config["volume_shape"]
+        self.raster_grid =  self.config["raster_grid"]
+        self.raster_spacing =  self.config["raster_spacing"]
+        self.voi_configs = self.config["voi_configs"]
+        self.max_beams = self.config["max_beams"]
+        self.max_steps = self.config["max_steps"] 
+        self.target_size = self.config["target_size"]
+        self.base_scene = self.config["base_config"]
+        self.dose_target = self.config["dose_target"]
+        self.epsilon = self.config["epsilon"]
+        self.num_layers = self.config["num_layers"]
         
-        self.volume_shape = tuple(config.get("volume_shape", (18, 18, 18)))
-        self.raster_grid = tuple(config.get("raster_grid", (4, 4)))
-        self.raster_spacing = tuple(config.get("raster_spacing", (1.0, 1.0)))
-        self.max_steps = config.get("max_steps", 3)
-        self.num_layers = config.get("num_layers", 6)
+        self.num_raster_points = self.raster_grid[0] * self.raster_grid[1]
+        self.volume_center = tuple(np.array(self.volume_shape) // 2)
         
-        # Scenario selection
-        self.scenario_name = config.get("scenario", "head_neck")
-        self.randomize_scenario = config.get("randomize_scenario", False)
-        
-        # Uncertainty parameters
-        self.range_uncertainty_std = config.get("range_uncertainty_std", 0.03)
-        self.setup_uncertainty_std = config.get("setup_uncertainty_std", 0.3)
-        self.apply_uncertainty = config.get("apply_uncertainty", True)
-        
-        # Reward weights
-        self.coverage_weight = config.get("coverage_weight", 5.0)
-        self.constraint_weight = config.get("constraint_weight", 2.0)
-        self.critical_violation_penalty = config.get("critical_violation_penalty", 5.0)
+        self.volume_mask = np.zeros(self.volume_shape, dtype=np.float32)
+        self.target_center = tuple(np.array(self.volume_shape) // 2)
+        self.target_mask = np.zeros(self.volume_shape, dtype=bool)
+        self.weights = []
         
         # Action space
-        self.num_raster = self.raster_grid[0] * self.raster_grid[1]
-        self.action_dim = 2 + self.num_layers + self.num_layers * self.num_raster
+        single_beam_low = np.concatenate([
+            np.array([-np.pi, -np.pi/3], dtype=np.float32), 
+            np.zeros(self.num_layers, dtype=np.float32),            
+            np.zeros(self.num_layers * self.num_raster_points, dtype=np.float32) 
+        ])
+        single_beam_high = np.concatenate([
+            np.array([np.pi, np.pi/3], dtype=np.float32), 
+            np.ones(self.num_layers, dtype=np.float32),            
+            np.ones(self.num_layers * self.num_raster_points, dtype=np.float32) 
+        ])
         
-        action_low = np.concatenate([
-            np.array([-np.pi, -np.pi/2]),
-            np.zeros(self.num_layers),
-            np.zeros(self.num_layers * self.num_raster)
-        ]).astype(np.float32)
-        
-        action_high = np.concatenate([
-            np.array([np.pi, np.pi/2]),
-            np.ones(self.num_layers),
-            np.ones(self.num_layers * self.num_raster)
-        ]).astype(np.float32)
-        
-        self.action_space = spaces.Box(low=action_low, high=action_high, dtype=np.float32)
-        
-        # Observation space
-        self.observation_space = spaces.Dict({
-            "dose": spaces.Box(0, np.inf, shape=(2,) + self.volume_shape, dtype=np.float32),
-            "step": spaces.Box(0, 1, shape=(1,), dtype=np.float32)
-        })
-        
-        # State
-        self.scenario = None
-        self.target_constraint = None
-        self.oar_constraints = []
-        self.structure_masks = {}
-        self.dose_total = None
-        self.beam_slots = []
-        self.step_count = 0
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        
-        # Select scenario
-        if self.randomize_scenario:
-            scenario_name = self.np_random.choice(list(self.SCENARIOS.keys()))
-        else:
-            scenario_name = self.scenario_name
-        
-        base_scenario = self.SCENARIOS[scenario_name](self.volume_shape)
-        self.scenario = perturb_scenario(
-            base_scenario,
-            self.volume_shape,
-            max_shift=1,
-            tolerance_noise=0.0,
-            rng=self.np_random
+        self.action_space = spaces.Box(low=single_beam_low, high=single_beam_high, dtype=np.float32)
+        self.action_dim = single_beam_low.size
+        #self.beam_params_shape = (self.max_beams*self.action_dim,)
+        self.observation_space = spaces.Box(
+            low=0.0, high=np.finfo(np.float32).max,
+            shape=(2,) + self.volume_shape, dtype=np.float32
             )
-        # Setup target
-        target_info = self.scenario["target"]
-        self.target_center = np.array(target_info["center"])
-        self.target_size = target_info["size"]
-        self.target_constraint = target_info["constraint"]
-        
-        # Setup OARs
-        self.oar_constraints = []
-        self.oar_infos = []
-        for oar_info in self.scenario["oars"]:
-            self.oar_constraints.append(oar_info["constraint"])
-            self.oar_infos.append(oar_info)
-        
-        
-        # Create masks
-        self._create_masks()
-        
-        # Initialize dose
+
+        self.beam_slots = [None for _ in range(self.max_beams)]
+        self.step_count = 0
         self.dose_total = np.zeros(self.volume_shape, dtype=np.float32)
-        self.beam_slots = []
+        #self.beam_params_array = np.zeros(self.beam_params_shape, dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None, config_override=None):
+        super().reset(seed=seed)
         self.step_count = 0
         
-        # Initial costs
-        self.prev_target_cost = self._get_target_underdose()
-        self.prev_violation_cost = 0.0
+        # Use perturb_config with collision detection
+        if config_override is not None:
+            cfg = config_override
+        else:
+            cfg = perturb_config(self.base_scene, self.volume_shape, rng=self.np_random)
+            #cfg = self.base_scene
+        # Rebuild masks
+        self.target_center = tuple(map(int, cfg["target_center"]))
+        self.target_size = tuple(map(int, cfg["target_size"]))
+        self.voi_configs = cfg["vois"]
         
-        state = np.stack([self.dose_total, self.structure_masks["combined"]], axis=0)
-        return {"dose": state.astype(np.float32), "step": np.array([0.0], dtype=np.float32)}, {}
-
-    def _create_masks(self):
-        """Create structure masks."""
-        self.structure_masks = {}
-        combined = np.zeros(self.volume_shape, dtype=np.float32)
+        self.volume_mask = np.zeros(self.volume_shape, dtype=np.float32)
+        self.weights = []
         
-        # Target mask (value = 1.0)
-        target_mask = np.zeros(self.volume_shape, dtype=bool)
-        self._fill_box(target_mask, self.target_center, self.target_size, True)
-        self.structure_masks["target"] = target_mask
-        combined[target_mask] = 1.0
-        
-        # OAR masks (values = 0.1 to 0.9 based on priority)
-        priority_values = {"critical": 0.2, "high": 0.4, "medium": 0.6, "low": 0.8}
-        
-        for constraint, info in zip(self.oar_constraints, self.oar_infos):
-            oar_mask = np.zeros(self.volume_shape, dtype=bool)
-            center = np.array(info["center"])
-            # Small perturbation
-            #center = np.clip(center + self.np_random.integers(-1, 2, size=3), 0, 
-            #               np.array(self.volume_shape) - 1)
-            self._fill_box(oar_mask, center, info["size"], True)
+        # Create masks from config
+        for voi in self.voi_configs:
+            center, weight, size = voi
+            self._create_voi_mask(self.volume_mask, center, size, weight)
+            self.weights.append(weight)
             
-            # Don't overlap with target
-            oar_mask = oar_mask & ~target_mask
-            
-            self.structure_masks[constraint.name] = oar_mask
-            combined[oar_mask] = priority_values.get(constraint.priority, 0.5)
-        
-        self.structure_masks["combined"] = combined
+        self.target_mask = self._create_target_mask(self.volume_mask, self.target_center, self.target_size)
 
-    def _fill_box(self, mask, center, size, value):
-        """Fill a box region in mask."""
-        c = np.array(center)
-        s = np.array(size)
-        slices = tuple(slice(max(0, int(c[i] - s[i]//2)), 
-                            min(mask.shape[i], int(c[i] + s[i]//2 + 1))) 
-                      for i in range(3))
-        mask[slices] = value
+        self.beam_slots = [None for _ in range(self.max_beams)]
+        self.dose_total = np.zeros(self.volume_shape, dtype=np.float32)
+        self.prev_target_cost = self._get_target_cost(self.dose_total)
+        self.prev_oar_cost = self._get_oar_cost(self.dose_total)
+        self.prev_body_cost = self._get_body_cost(self.dose_total)
+        #self.beam_params_array = np.zeros(self.beam_params_shape, dtype=np.float32)
+        
+        self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
+        obs = {
+            "dose": self.state
+        }
+        return obs, {}
 
     def step(self, action):
-        action = np.asarray(action).ravel()
+        action = np.asarray(action, dtype=float).ravel()
         
+        i = self.step_count 
+        start_idx = i * self.action_dim
+        end_idx = (i + 1) * self.action_dim
+        #self.beam_params_array[start_idx:end_idx] = action
+
         gantry = float(action[0])
-        elevation = float(action[1])
-        energies = np.clip(action[2:2+self.num_layers], 0, 1)
-        intensities = np.clip(action[2+self.num_layers:], 0, 1)
+        couch = float(action[1])
+        #print(f"Step {self.step_count}: gantry={gantry:.4f}, couch={couch:.4f}", flush=True)
+        energy_u = action[2: 2 + self.num_layers]
+        ints = action[2 + self.num_layers : 2 + self.num_layers + self.num_layers * self.num_raster_points]
         
-        # Sample uncertainties
-        if self.apply_uncertainty:
-            range_factor = 1.0 + self.np_random.normal(0, self.range_uncertainty_std)
-            setup_error = self.np_random.normal(0, self.setup_uncertainty_std, size=3)
-        else:
-            range_factor = 1.0
-            setup_error = None
+        beam = Beam(
+            gantry_angle=gantry,
+            couch_angle=couch,
+            raster_grid_size=self.raster_grid,
+            raster_spacing=self.raster_spacing,
+            volume_shape=self.volume_shape
+        )
+
+        ints = np.clip(ints, 0.0, 1.0)
         
-        # Create and apply beam
-        beam = Beam(gantry, elevation, self.raster_grid, self.raster_spacing,
-                   self.volume_shape, self.target_center, setup_error)
-        
-        dose_contrib = np.zeros(self.volume_shape, dtype=np.float32)
-        compute_dose(
-            dose_contrib,
-            np.ascontiguousarray(beam.raster_points),
-            np.ascontiguousarray(beam.direction),
-            np.ascontiguousarray(intensities),
-            np.ascontiguousarray(energies),
-            np.array(self.volume_shape),
-            self.num_layers,
-            range_factor
+        # This now calls the Numba-optimized version
+        dose_beam, raster_points, source_point = beam.apply_dose(
+            np.zeros(self.volume_shape, dtype=np.float32),
+            intensities=ints,
+            energy_u=energy_u, 
+            num_raster_points=self.num_raster_points
         )
         
-        self.dose_total += dose_contrib
-        self.beam_slots.append({
-            "gantry": gantry, "elevation": elevation,
-            "direction": beam.direction, "source_point": beam.source_point,
-            "raster_points": beam.raster_points
-        })
+        self.dose_total += dose_beam
         
-        # Compute reward
-        reward = self._compute_reward()
+        self.beam_slots[i] = {
+            "active": True,
+            "gantry": gantry,
+            "couch": couch,
+            "intensities": ints.copy(),
+            "raster_points": raster_points,
+            "source_point": source_point,
+            "direction": beam.direction
+        }
+
+        self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
+        obs = self.state
         
+        #reward = self._compute_reward(self.dose_total)
+        # ---------------- NEW REWARD LOGIC ----------------
+        # 1. Calculate New Costs
+        curr_target_cost = self._get_target_cost(self.dose_total)
+        curr_oar_cost = self._get_oar_cost(self.dose_total)
+        #curr_body_cost = self._get_body_cost(self.dose_total)
+        # 2. Calculate Diffs
+        # Improvement > 0 if we added dose to tumor
+        target_improvement = self.prev_target_cost - curr_target_cost
+        
+        # Degradation > 0 if we hit an OAR (Cost went up)
+        oar_degradation = curr_oar_cost - self.prev_oar_cost
+        #body_degradation = curr_body_cost - self.prev_body_cost
+        # 3. Define Weights
+        w_progress = 2  # Reward for fixing the tumor
+        w_safety = 2   # Penalty for hitting OAR (Higher priority)
+        w_final = 2 
+        w_body = 0.1
+        #penalty for hitting body volume
+        
+        # 4. Step Reward
+        # Reward for target progress - Penalty for OAR damage
+        reward = (w_progress * target_improvement) - (w_safety * oar_degradation) #- (w_body)
+
         self.step_count += 1
-        eval_results = self.evaluate()
-        summary = eval_results["summary"]
-    
-        # Check termination conditions
-        target_achieved = summary["target_passed"]
-        no_critical_violations = summary["critical_violations"] == 0
-        plan_acceptable = summary["plan_acceptable"]  # target_passed AND no critical violations
-    
-        max_steps_reached = self.step_count >= self.max_steps
-    
-        # Early termination if plan is acceptable
-        done = max_steps_reached or target_achieved
-        #done = self.step_count >= self.max_steps
+        terminated = (self.step_count >= self.max_steps)
+        if terminated:
+            reward -= (w_final * curr_target_cost)
+            
+        # 6. Update History
+        self.prev_target_cost = curr_target_cost
+        self.prev_oar_cost = curr_oar_cost
         
-        if done:
-            if plan_acceptable:
-                terminal_reward = self._compute_terminal_reward(eval_results)
-                reward += terminal_reward
-            else:
-                penalty_violation = -1
-                reward+=penalty_violation
+        # Clip for stability
+        #reward = float(np.clip(reward, -20.0, 5.0))
         
-        state = np.stack([self.dose_total, self.structure_masks["combined"]], axis=0)
-        return {"dose": state.astype(np.float32), 
-                "step": np.array([self.step_count / self.max_steps], dtype=np.float32)}, \
-               float(reward), done, False, {}
+        return obs, float(reward), terminated, False, {}
 
-    def _compute_reward(self):
-        """Step reward based on improvement."""
-        # Target improvement
-        curr_underdose = self._get_target_underdose()
-        target_improvement = self.prev_target_cost - curr_underdose
-        self.prev_target_cost = curr_underdose
+    def _get_target_cost(self, dose):
+        """ Calculate Mean Squared Underdose Error for Target """
+        target_mask = np.isclose(self.volume_mask, 1)
+        if not np.any(target_mask): return 1.0 # Should not happen
         
-        # Constraint violation increase
-        curr_violation = self._get_total_violation_cost()
-        violation_increase = curr_violation - self.prev_violation_cost
-        self.prev_violation_cost = curr_violation
-        
-        reward = self.coverage_weight * target_improvement - self.constraint_weight * violation_increase
-        return reward * 10.0  # Scale
-
-    def _compute_terminal_reward(self, eval_results):
-        """Terminal reward based on final plan quality."""
-        reward = 0.0
-        
-        # Coverage bonus
-        coverage = eval_results["target"]["coverage"]
-        reward += self.coverage_weight * coverage / 100.0
-        
-        # Constraint violation penalties
-        for oar_name, oar_result in eval_results["oars"].items():
-            if not oar_result["passed"]:
-                if oar_result["priority"] == "critical":
-                    reward -= self.critical_violation_penalty
-                elif oar_result["priority"] == "high":
-                    reward -= self.constraint_weight
-                else:
-                    reward -= self.constraint_weight * 0.5
-        
-        return reward
-
-    def _get_target_underdose(self):
-        """Get mean underdose in target."""
-        target_doses = self.dose_total[self.structure_masks["target"]]
-        if len(target_doses) == 0:
-            return 1.0
-        underdose = np.maximum(self.target_constraint.prescription_dose - target_doses, 0)
+        target_doses = dose[target_mask]
+        # Error = (1.0 - dose)^2, only if dose < 1.0
+        diff = 1.0 - target_doses
+        underdose = np.maximum(diff, 0.0)
         return np.mean(underdose)
 
-    def _get_total_violation_cost(self):
-        """Sum of constraint violation magnitudes."""
-        cost = 0.0
-        for constraint in self.oar_constraints:
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None or not mask.any():
-                continue
-            doses = self.dose_total[mask]
-            
-            if constraint.max_dose is not None:
-                excess = np.maximum(np.max(doses) - constraint.max_dose, 0)
-                cost += excess
-            
-            if constraint.mean_dose is not None:
-                excess = np.maximum(np.mean(doses) - constraint.mean_dose, 0)
-                cost += excess
+    def _get_oar_cost(self, dose):
+        """ Calculate Mean Squared Overdose Error for OARs """
+        total_oar_cost = 0.0
+        unique_vals = np.unique(self.volume_mask)
         
-        return cost
+        for val in unique_vals:
+            if val == 0.0 or np.isclose(val, 1.0): continue
+            
+            voi_mask = np.isclose(self.volume_mask, val)
+            if not np.any(voi_mask): continue
+            
+            voi_doses = dose[voi_mask]
+            tolerance = float(val)
+            
+            # Error = (dose - tolerance)^2, only if dose > tolerance
+            diff = voi_doses - tolerance
+            overdose = np.maximum(diff, 0.0)
+            total_oar_cost += np.mean(overdose)
+            
+        return total_oar_cost
+    
+    def _get_body_cost(self, dose):
+        """ Calculate Mean Squared Overdose Error for Body Volume """
+        body_mask = np.isclose(self.volume_mask, 0.0)
+        if not np.any(body_mask): return 0.0 # Should not happen
+        
+        body_doses = dose[body_mask]
+        tolerance = 0.0
+        
+        # Error = (dose - tolerance)^2, only if dose > tolerance
+        diff = body_doses - tolerance
+        overdose = np.maximum(diff, 0.0)
+        return np.mean(overdose**2)
 
-    def evaluate(self) -> Dict:
-        """Full clinical evaluation of current plan."""
-        results = {
-            "scenario": self.scenario["name"],
-            "target": {},
-            "oars": {},
-            "summary": {}
-        }
+    def _compute_reward(self, dose):
+        """
+        Updated Reward using Voxel-Wise One-Sided Penalty.
+        - Target: Penalizes (1.0 - dose)^2 only for voxels < 1.0. 
+                  (Ignores overdose, penalizes cold spots).
+        - OAR: Penalizes (dose - tolerance)^2 only for voxels > tolerance.
+                  (Penalizes hot spots).
+        """
+        # 1. Check Target Existence
+        target_mask = np.isclose(self.volume_mask, 1)
+        if not np.any(target_mask):
+             return -10.0 
         
-        # Evaluate target
-        target_doses = self.dose_total[self.structure_masks["target"]]
-        results["target"] = self.target_constraint.evaluate(target_doses)
+        # --- TARGET PENALTY (Voxel-wise Underdose) ---
+        target_doses = dose[target_mask]
         
-        # Evaluate OARs
-        n_violations = 0
-        critical_violations = 0
+        # Calculate difference: 1.0 - dose
+        # If dose is 0.8, diff is 0.2 (Penalty).
+        # If dose is 1.5, diff is -0.5. We clip this to 0.0 (No penalty for overdose).
+        diff_target = 1.0 - target_doses
+        underdose_errors = np.maximum(diff_target, 0.0)
         
-        for constraint in self.oar_constraints:
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None or not mask.any():
+        # Mean Squared Error of the underdosed voxels
+        # This penalizes both low mean AND poor coverage (cold spots)
+        target_penalty = np.mean(underdose_errors**2)
+        
+        # --- OAR PENALTY (Voxel-wise Overdose) ---
+        unique_vals = np.unique(self.volume_mask)
+        oar_penalty = 0.0
+        
+        for val in unique_vals:
+            # Skip background (0) and target (1)
+            if val == 0.0 or np.isclose(val, 1.0):
                 continue
             
-            oar_doses = self.dose_total[mask]
-            oar_result = constraint.evaluate(oar_doses)
-            results["oars"][constraint.name] = oar_result
+            voi_mask = np.isclose(self.volume_mask, val)
+            if not np.any(voi_mask):
+                continue
             
-            if not oar_result["passed"]:
-                n_violations += 1
-                if constraint.priority == "critical":
-                    critical_violations += 1
-        
-        # Summary
-        results["summary"] = {
-            "target_coverage": results["target"]["coverage"],
-            "target_passed": results["target"]["passed"],
-            "n_oar_violations": n_violations,
-            "critical_violations": critical_violations,
-            "plan_acceptable": results["target"]["passed"] and critical_violations == 0
-        }
-        
-        return results
+            voi_doses = dose[voi_mask]
+            tolerance = float(val) # Using the mask value as the tolerance
+            
+            # Calculate excess: dose - tolerance
+            # If dose > tolerance, we get positive penalty.
+            # If dose < tolerance, we get negative, which we clip to 0.0.
+            diff_voi = voi_doses - tolerance
+            overdose_errors = np.maximum(diff_voi, 0.0)
+            
+            # Mean Squared Error of the overdosed voxels
+            # This penalizes hot spots even if the mean is fine
+            oar_penalty += np.mean(overdose_errors**2)
 
-    def render(self, mode="clinical"):
-        """
-        Clinical-style rendering.
+        # --- WEIGHTS ---
+        # Since we are squaring errors, values might be smaller than before.
+        # You might need to tune these.
+        alpha = 5.0   # Weight for Target Underdose
+        beta = 5.0    # Weight for OAR Overdose
         
-        Colors:
-        - Target: Green (covered) / Black (underdosed)
-        - OARs: Green (within constraint) / Red (violated)
-        - Dose cloud: Viridis colormap
-        """
-        fig = plt.figure(figsize=(16, 6))
+        # Reward calculation
+        # Max reward is 1.0 (Perfect plan).
+        reward = 1.0 - (alpha * target_penalty + beta * oar_penalty)
         
-        # Get evaluation
-        eval_results = self.evaluate()
-        rx = self.target_constraint.prescription_dose
+        return float(np.clip(reward, -10.0, 10.0))
+
+    @staticmethod
+    def _create_target_mask(mask_volume, target_center, target_size):
+        mask = mask_volume
+        x0, y0, z0 = target_center
+        dx, dy, dz = target_size
+        x_start = max(0, x0 - dx // 2)
+        x_end = min(mask_volume.shape[0], x0 + dx // 2 + 1)
+        y_start = max(0, y0 - dy // 2)
+        y_end = min(mask_volume.shape[1], y0 + dy // 2 + 1)
+        z_start = max(0, z0 - dz // 2)
+        z_end = min(mask_volume.shape[2], z0 + dz // 2 + 1)
+        mask[x_start:x_end, y_start:y_end, z_start:z_end] = 1
+        return np.isclose(mask, 1)
+
+    @staticmethod
+    def _create_voi_mask(mask_volume, voi_center, voi_size, weight):
+        mask = mask_volume
+        x0, y0, z0 = voi_center
+        sx, sy, sz = voi_size
+        x_start = max(0, x0 - sx // 2)
+        x_end = min(mask_volume.shape[0], x0 + sx // 2 + 1)
+        y_start = max(0, y0 - sy // 2)
+        y_end = min(mask_volume.shape[1], y0 + sy // 2 + 1)
+        z_start = max(0, z0 - sz // 2)
+        z_end = min(mask_volume.shape[2], z0 + sz // 2 + 1)
         
-        # 1. 3D View
-        ax1 = fig.add_subplot(131, projection='3d')
-        self._render_3d(ax1, eval_results, rx)
+        # Only overwrite empty space (0.0). Do not overwrite existing VOIs or Target.
+        # Note: _create_target_mask is usually called last or logic needs care.
+        # In reset(), we call _create_voi_mask FIRST, then target.
+        # So here we just write. Target will overwrite later.
         
-        # 2. Axial slice
-        ax2 = fig.add_subplot(132)
-        self._render_slice(ax2, eval_results, rx, axis=2)
-        ax2.set_title('Axial Slice (z=center)')
-        
-        # 3. DVH
-        ax3 = fig.add_subplot(133)
-        self._render_dvh(ax3)
-        
-        # Title with summary
-        summary = eval_results["summary"]
-        title = f"{self.scenario['name']} | "
-        title += f"Coverage: {summary['target_coverage']:.1f}% | "
-        title += f"Violations: {summary['n_oar_violations']} "
-        title += f"(Critical: {summary['critical_violations']})"
-        fig.suptitle(title, fontsize=12, fontweight='bold')
-        
-        plt.tight_layout()
-        
+        region = mask[x_start:x_end, y_start:y_end, z_start:z_end]
+        # Only write where it is currently 0 to prevent VOI-on-VOI overwrite issues
+        # (though perturb_config tries to prevent physical overlap)
+        region[region == 0] = float(weight)
+        return mask
+
+    def render(self, dose_threshold=0.05, beam_length=25, show=True, save_path=None):
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_xlim(-5, self.state[0].shape[0]+5)
+        ax.set_ylim(-5, self.state[0].shape[1]+5)
+        ax.set_zlim(-5, self.state[0].shape[2]+5)
+        ax.set_box_aspect([1, 1, 1])
+        cmap = cm.get_cmap("viridis")
+        norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+
+        # Base dose
+        x, y, z = np.where(self.state[0] > 0)
+        dose_vals = self.state[0][x, y, z]
+        ax.scatter(x+0.5, y+0.5, z+0.5, c=cmap(norm(dose_vals)), alpha=0.1, s=10, zorder=1)
+
+        # Target
+        x_t, y_t, z_t = np.where(self.volume_mask == 1)
+        if len(x_t) > 0:
+            dose_vals_t = self.state[0][x_t, y_t, z_t]
+            ax.scatter(x_t+0.5, y_t+0.5, z_t+0.5, c=cmap(norm(dose_vals_t)), marker='o', s=15, edgecolors='black', alpha=1.0, zorder=3)
+
+        # VOIs
+        for weight in self.weights:
+            x_v, y_v, z_v = np.where(np.isclose(self.volume_mask, weight))
+            if len(x_v) > 0:
+                dose_vals_v = self.state[0][x_v, y_v, z_v]
+                ax.scatter(x_v+0.5, y_v+0.5, z_v+0.5, c=cmap(norm(dose_vals_v)), marker='s', s=15, edgecolors='blue', alpha=1.0, zorder=4)
+
+        # Beams
+        t = np.linspace(0, beam_length, 20)
+        for beam in self.beam_slots:
+            if beam is None: continue
+            src = np.array(beam["source_point"], dtype=float)
+            ax.scatter(*src, color='red', marker='x', s=50, linewidths=2, zorder=5)
+            for p0 in beam["raster_points"]:
+                direction = np.array(beam["direction"], dtype=float)
+                line = p0.reshape((3,1)) + np.outer(direction, t)
+                ax.plot(line[0,:], line[1,:], line[2,:], color='cyan', alpha=0.4, linewidth=0.8, zorder=2)
+
         buf = BytesIO()
         plt.savefig(buf, format='png', dpi=150)
         buf.seek(0)
         img = plt.imread(buf)
         plt.close(fig)
         return (img * 255).astype(np.uint8)
-
-    def _render_3d(self, ax, eval_results, rx):
-        """Render 3D view with clinical coloring."""
-        ax.set_xlim(0, self.volume_shape[0])
-        ax.set_ylim(0, self.volume_shape[1])
-        ax.set_zlim(0, self.volume_shape[2])
-        
-        # Target voxels
-        target_mask = self.structure_masks["target"]
-        x, y, z = np.where(target_mask)
-        if len(x) > 0:
-            doses = self.dose_total[target_mask]
-            colors = np.where(doses >= rx * 0.95, 'green', 'black')
-            ax.scatter(x+0.5, y+0.5, z+0.5, c=colors, s=50, alpha=0.8, 
-                      edgecolors='darkgreen', linewidths=0.5)
-        
-        # OAR voxels
-        for constraint in self.oar_constraints:
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None or not mask.any():
-                continue
-            
-            oar_result = eval_results["oars"].get(constraint.name, {})
-            passed = oar_result.get("passed", True)
-            
-            x, y, z = np.where(mask)
-            if len(x) > 0:
-                doses = self.dose_total[mask]
-                
-                # Color based on violation
-                if constraint.max_dose is not None:
-                    violated = doses > constraint.max_dose
-                elif constraint.mean_dose is not None:
-                    violated = np.full_like(doses, not passed, dtype=bool)
-                else:
-                    violated = np.zeros_like(doses, dtype=bool)
-                
-                colors = np.where(violated, 'red', 'lightgreen')
-                ax.scatter(x+0.5, y+0.5, z+0.5, c=colors, s=20, alpha=0.5,
-                          marker='s', edgecolors='gray', linewidths=0.3)
-        
-        # Beams
-        for i, beam in enumerate(self.beam_slots):
-            src = beam["source_point"]
-            ax.scatter(*src, c='blue', marker='x', s=100)
-            
-            for p0 in beam["raster_points"][::4]:
-                t = np.linspace(0, 20, 10)
-                line = p0.reshape(3,1) + np.outer(beam["direction"], t)
-                ax.plot(line[0], line[1], line[2], 'c-', alpha=0.2, linewidth=0.5)
-        
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('3D View')
-
-    def _render_slice(self, ax, eval_results, rx, axis=2):
-        """Render 2D slice with clinical coloring."""
-        mid = self.volume_shape[axis] // 2
-        
-        if axis == 2:
-            dose_slice = self.dose_total[:, :, mid]
-            combined_slice = self.structure_masks["combined"][:, :, mid]
-        elif axis == 1:
-            dose_slice = self.dose_total[:, mid, :]
-            combined_slice = self.structure_masks["combined"][:, mid, :]
-        else:
-            dose_slice = self.dose_total[mid, :, :]
-            combined_slice = self.structure_masks["combined"][mid, :, :]
-        
-        # Create RGB image
-        rgb = np.zeros(dose_slice.shape + (3,))
-        
-        # Dose colormap (background)
-        dose_norm = np.clip(dose_slice / (rx * 1.2), 0, 1)
-        rgb[..., 0] = dose_norm  # Red channel for dose
-        rgb[..., 1] = dose_norm * 0.5
-        rgb[..., 2] = 0
-        
-        # Overlay structures
-        # Target: green if covered, black if cold
-        target_slice = self.structure_masks["target"]
-        if axis == 2:
-            target_slice = target_slice[:, :, mid]
-        elif axis == 1:
-            target_slice = target_slice[:, mid, :]
-        else:
-            target_slice = target_slice[mid, :, :]
-        
-        covered = (dose_slice >= rx * 0.95) & target_slice
-        cold = (dose_slice < rx * 0.95) & target_slice
-        
-        rgb[covered] = [0, 0.8, 0]  # Green
-        rgb[cold] = [0.1, 0.1, 0.1]  # Dark gray/black
-        
-        # OARs: green if OK, red if violated
-        for constraint in self.oar_constraints:
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None:
-                continue
-            
-            if axis == 2:
-                oar_slice = mask[:, :, mid]
-            elif axis == 1:
-                oar_slice = mask[:, mid, :]
-            else:
-                oar_slice = mask[mid, :, :]
-            
-            oar_result = eval_results["oars"].get(constraint.name, {})
-            
-            if constraint.max_dose is not None:
-                violated = (dose_slice > constraint.max_dose) & oar_slice
-                ok = (dose_slice <= constraint.max_dose) & oar_slice
-            else:
-                ok = oar_slice
-                violated = np.zeros_like(oar_slice)
-            
-            rgb[ok] = [0.5, 1.0, 0.5]  # Light green
-            rgb[violated] = [1.0, 0.2, 0.2]  # Red
-        
-        ax.imshow(rgb.transpose(1, 0, 2), origin='lower')
-        
-        # Add contours
-        ax.contour(target_slice.T, levels=[0.5], colors='green', linewidths=2)
-        for constraint in self.oar_constraints:
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None:
-                continue
-            if axis == 2:
-                oar_slice = mask[:, :, mid]
-            elif axis == 1:
-                oar_slice = mask[:, mid, :]
-            else:
-                oar_slice = mask[mid, :, :]
-            ax.contour(oar_slice.T, levels=[0.5], colors='blue', linewidths=1, linestyles='--')
-
-    def _render_dvh(self, ax):
-        """Render Dose-Volume Histogram."""
-        # Target DVH
-        target_doses = self.dose_total[self.structure_masks["target"]]
-        if len(target_doses) > 0:
-            sorted_doses = np.sort(target_doses)[::-1]
-            volumes = np.linspace(0, 100, len(sorted_doses))
-            ax.plot(sorted_doses, volumes, 'g-', linewidth=2, label='Target')
-        
-        # OAR DVHs
-        colors = plt.cm.tab10(np.linspace(0, 1, len(self.oar_constraints)))
-        for i, constraint in enumerate(self.oar_constraints):
-            mask = self.structure_masks.get(constraint.name)
-            if mask is None or not mask.any():
-                continue
-            
-            oar_doses = self.dose_total[mask]
-            sorted_doses = np.sort(oar_doses)[::-1]
-            volumes = np.linspace(0, 100, len(sorted_doses))
-            
-            style = '-' if constraint.priority in ['critical', 'high'] else '--'
-            ax.plot(sorted_doses, volumes, style, color=colors[i], 
-                   linewidth=1.5, label=constraint.name[:15])
-            
-            # Mark Dmax constraint
-            if constraint.max_dose is not None:
-                ax.axvline(constraint.max_dose, color=colors[i], linestyle=':', alpha=0.5)
-        
-        ax.set_xlabel('Dose')
-        ax.set_ylabel('Volume (%)')
-        ax.set_title('DVH')
-        ax.legend(fontsize=8, loc='upper right')
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim(0, None)
-        ax.set_ylim(0, 100)
-
-    def print_evaluation(self):
-        """Print detailed evaluation report."""
-        results = self.evaluate()
-        
-        print("\n" + "="*60)
-        print(f"TREATMENT PLAN EVALUATION: {results['scenario']}")
-        print("="*60)
-        
-        # Target
-        t = results["target"]
-        print(f"\n📎 TARGET: {t['name']}")
-        print(f"   Coverage (V100): {t['coverage']:.1f}%")
-        for metric, value in t["metrics"].items():
-            print(f"   {metric}: {value:.3f}")
-        if t["violations"]:
-            print(f"   ⚠️  Violations: {', '.join(t['violations'])}")
-        else:
-            print(f"   ✅ All constraints met")
-        
-        # OARs
-        print(f"\n📋 ORGANS AT RISK:")
-        for name, oar in results["oars"].items():
-            status = "✅" if oar["passed"] else "❌"
-            print(f"\n   {status} {name} [{oar['priority']}]")
-            for metric, value in oar["metrics"].items():
-                print(f"      {metric}: {value:.3f}")
-            if oar["violations"]:
-                for v in oar["violations"]:
-                    print(f"      ⚠️  {v}")
-        
-        # Summary
-        s = results["summary"]
-        print(f"\n" + "-"*40)
-        print(f"SUMMARY:")
-        print(f"   Target Coverage: {s['target_coverage']:.1f}%")
-        print(f"   OAR Violations: {s['n_oar_violations']}")
-        print(f"   Critical Violations: {s['critical_violations']}")
-        print(f"   Plan Acceptable: {'✅ YES' if s['plan_acceptable'] else '❌ NO'}")
-        print("="*60 + "\n")
-        
-        return results
