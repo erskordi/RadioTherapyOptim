@@ -488,9 +488,7 @@ class BeamAngleEnv(gym.Env):
         #self.beam_params_array = np.zeros(self.beam_params_shape, dtype=np.float32)
         
         self.state = np.stack([self.dose_total, self.volume_mask.astype(np.float32)], axis=0)
-        obs = {
-            "dose": self.state
-        }
+        obs = self.state
         return obs, {}
 
     def step(self, action):
