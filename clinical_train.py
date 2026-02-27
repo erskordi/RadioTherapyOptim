@@ -386,7 +386,8 @@ class DACRS:
 # -----------------------------------------------------------
 # 4. MAIN TRAINING LOOP
 # -----------------------------------------------------------
-SAVE_DIR = "clinical_eta_0_alpha_0_1"
+#SAVE_DIR = "clinical_eta_0_alpha_0_1"
+SAVE_DIR = "error_eta_0_alpha_0_1"
 os.makedirs(SAVE_DIR, exist_ok=True)
 if __name__ == "__main__":
     voi_configs18 = [

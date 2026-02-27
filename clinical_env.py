@@ -782,7 +782,22 @@ class BeamAngleEnv(gym.Env):
                 direction = np.array(beam["direction"], dtype=float)
                 line = p0.reshape((3,1)) + np.outer(direction, t)
                 ax.plot(line[0,:], line[1,:], line[2,:], color='cyan', alpha=0.4, linewidth=0.8, zorder=2)
+        
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, shrink=0.5, pad=0.1, label='Dose')
+        import matplotlib.lines as mlines
 
+        target_handle = mlines.Line2D(
+            [], [], color='none', marker='o', markerfacecolor='gray',
+            markeredgecolor='black', markersize=6, label='Target Tumor'
+        )
+        oar_handle = mlines.Line2D(
+            [], [], color='none', marker='s', markerfacecolor='gray',
+            markeredgecolor='blue', markersize=6, label='OARs'
+        )
+        ax.legend(handles=[target_handle, oar_handle], loc='upper left',
+                  bbox_to_anchor=(0.0, 1.0), fontsize=8, framealpha=0.7)
         buf = BytesIO()
         plt.savefig(buf, format='png', dpi=150)
         buf.seek(0)
