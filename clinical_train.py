@@ -368,7 +368,7 @@ class DACRS:
             new_action = self.action_low_tensor + 0.5 * (new_action + 1.0) * (self.action_high_tensor - self.action_low_tensor)
             cvar = self.get_ensemble_cvar(state, new_action, self.alpha_cvar)
             mean = self.get_ensemble_mean(state, new_action)
-            eta = 1
+            eta = 0
             actor_loss = -((1-eta) * mean.mean() + eta * cvar.mean())
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -386,7 +386,7 @@ class DACRS:
 # -----------------------------------------------------------
 # 4. MAIN TRAINING LOOP
 # -----------------------------------------------------------
-SAVE_DIR = "clinical_eta_1_alpha_0_1"
+SAVE_DIR = "clinical_eta_0_alpha_0_1"
 os.makedirs(SAVE_DIR, exist_ok=True)
 if __name__ == "__main__":
     voi_configs18 = [

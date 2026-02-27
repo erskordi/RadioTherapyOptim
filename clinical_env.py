@@ -497,11 +497,11 @@ class BeamAngleEnv(gym.Env):
         i = self.step_count 
         start_idx = i * self.action_dim
         end_idx = (i + 1) * self.action_dim
-        #self.beam_params_array[start_idx:end_idx] = action
+        
 
         gantry = float(action[0])
         couch = float(action[1])
-        #print(f"Step {self.step_count}: gantry={gantry:.4f}, couch={couch:.4f}", flush=True)
+        
         energy_u = action[2: 2 + self.num_layers]
         ints = action[2 + self.num_layers : 2 + self.num_layers + self.num_layers * self.num_raster_points]
         
