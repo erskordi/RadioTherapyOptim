@@ -431,12 +431,12 @@ class BeamAngleEnv(gym.Env):
         
         # Action space
         single_beam_low = np.concatenate([
-            np.array([-np.pi, -np.pi/3], dtype=np.float32), 
+            np.array([-np.pi, -np.pi/2], dtype=np.float32), 
             np.zeros(self.num_layers, dtype=np.float32),            
             np.zeros(self.num_layers * self.num_raster_points, dtype=np.float32) 
         ])
         single_beam_high = np.concatenate([
-            np.array([np.pi, np.pi/3], dtype=np.float32), 
+            np.array([np.pi, np.pi/2], dtype=np.float32), 
             np.ones(self.num_layers, dtype=np.float32),            
             np.ones(self.num_layers * self.num_raster_points, dtype=np.float32) 
         ])
@@ -556,6 +556,7 @@ class BeamAngleEnv(gym.Env):
         w_safety = 2   # Penalty for hitting OAR (Higher priority)
         w_final = 2 
         w_body = 0.1
+        early_stop_bonus = 2
         #penalty for hitting body volume
         
         # 4. Step Reward
@@ -563,9 +564,14 @@ class BeamAngleEnv(gym.Env):
         reward = (w_progress * target_improvement) - (w_safety * oar_degradation) #- (w_body)
 
         self.step_count += 1
-        terminated = (self.step_count >= self.max_steps)
+        target_mask = np.isclose(self.volume_mask, 1)
+        coverage = np.mean(self.dose_total[target_mask] >= 1.0)
+        target_covered = coverage >= 0.95
+        terminated = (self.step_count >= self.max_steps) or target_covered
         if terminated:
             reward -= (w_final * curr_target_cost)
+            if target_covered and self.step_count < self.max_steps:
+                reward += early_stop_bonus
             
         # 6. Update History
         self.prev_target_cost = curr_target_cost
@@ -585,7 +591,23 @@ class BeamAngleEnv(gym.Env):
         # Error = (1.0 - dose)^2, only if dose < 1.0
         diff = 1.0 - target_doses
         underdose = np.maximum(diff, 0.0)
-        return np.mean(underdose)
+        return np.sum(underdose)
+    
+    def _get_oar_violation_rate(self, dose):
+        total_voxels = 0
+        total_violated = 0
+        for val in np.unique(self.volume_mask):
+            if val == 0.0 or np.isclose(val, 1.0): 
+                continue
+            voi_mask = np.isclose(self.volume_mask, val)
+            total_voxels += np.sum(voi_mask)
+            total_violated += np.sum(dose[voi_mask] > float(val))
+        if total_voxels == 0: 
+            return 0.0
+        return float(total_violated / total_voxels)  # e.g. 5/100 = 0.05
+    def _get_target_coverage(self, dose):
+        target_mask = np.isclose(self.volume_mask, 1)
+        return float(np.mean(dose[target_mask] >= 1.0))
 
     def _get_oar_cost(self, dose):
         """ Calculate Mean Squared Overdose Error for OARs """
@@ -604,7 +626,7 @@ class BeamAngleEnv(gym.Env):
             # Error = (dose - tolerance)^2, only if dose > tolerance
             diff = voi_doses - tolerance
             overdose = np.maximum(diff, 0.0)
-            total_oar_cost += np.mean(overdose)
+            total_oar_cost += np.sum(overdose)
             
         return total_oar_cost
     
@@ -676,7 +698,7 @@ class BeamAngleEnv(gym.Env):
         # --- WEIGHTS ---
         # Since we are squaring errors, values might be smaller than before.
         # You might need to tune these.
-        alpha = 5.0   # Weight for Target Underdose
+        alpha = 10.0   # Weight for Target Underdose
         beta = 5.0    # Weight for OAR Overdose
         
         # Reward calculation
